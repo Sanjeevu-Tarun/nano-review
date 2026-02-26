@@ -1,34 +1,27 @@
 /**
- * scraper.js - Speed-optimized nanoreview scraper
+ * scraper.js - Maximum speed nanoreview scraper
  *
- * STRATEGY (fastest to slowest):
- * 1. Memory cache hit → <5ms
- * 2. File cache hit → <20ms
- * 3. Direct HTTP with CF cookies → ~300-600ms (search + page fetch in parallel)
- * 4. Direct HTTP without CF cookies → might fail, falls back
- * 5. Browser (single navigation, directly to device page) → ~2-4s
- *
- * The browser is NEVER used for search API calls — only for HTML page fetching
- * when CF cookies aren't available or have expired.
+ * CRITICAL PATH OPTIMIZATIONS:
+ * 1. Race top-2 types first, start fetching device page the moment we have a slug
+ * 2. Search + page fetch overlap via streaming pipeline
+ * 3. Regex-extract __NEXT_DATA__ instead of full cheerio DOM parse
+ * 4. Only fall back to full types if top-2 miss
  */
 import * as cheerio from 'cheerio';
-import { getCFCookies, waitForCloudflare, browserFetchDirect, browserSearchDirect, warmUp as browserWarmUp } from './browser.js';
+import { getCFCookies, browserFetchDirect, browserSearchDirect } from './browser.js';
 import { cache, TTL } from './cache.js';
 import { directSearch, directFetchHtml } from './http.js';
 
-const detectLikelyTypes = (query) => {
+// Top-2 most likely types per query pattern (used for fast-path race)
+const detectTypes = (query) => {
     const q = query.toLowerCase();
-    if (/ryzen|intel|core|threadripper|xeon|celeron|pentium|i[3579]-|amd|snapdragon|mediatek|exynos|dimensity|a[0-9]{2}\s*bionic/i.test(q))
-        return ['cpu', 'soc', 'laptop', 'phone', 'tablet', 'gpu'];
-    if (/nvidia|rtx|gtx|radeon|rx\s*[0-9]|geforce|quadro|vega|arc\s*a[0-9]/i.test(q))
-        return ['gpu', 'laptop', 'cpu', 'phone', 'tablet', 'soc'];
-    if (/iphone|galaxy|pixel|oneplus|xiaomi|oppo|vivo|realme|nothing\s*phone|poco|redmi/i.test(q))
-        return ['phone', 'soc', 'tablet', 'laptop', 'cpu', 'gpu'];
-    if (/ipad|galaxy\s*tab|surface|tab\s*s[0-9]/i.test(q))
-        return ['tablet', 'phone', 'soc', 'laptop', 'cpu', 'gpu'];
-    if (/macbook|thinkpad|xps|zenbook|vivobook|laptop|notebook|ultrabook|chromebook/i.test(q))
-        return ['laptop', 'cpu', 'gpu', 'tablet', 'phone', 'soc'];
-    return ['phone', 'tablet', 'laptop', 'soc', 'cpu', 'gpu'];
+    if (/ryzen|intel|core i[3579]|threadripper|xeon|celeron|pentium/i.test(q)) return { top: ['cpu', 'laptop'], rest: ['soc', 'phone', 'tablet', 'gpu'] };
+    if (/snapdragon|mediatek|exynos|dimensity|a[0-9]{2}\s*bionic|helio/i.test(q)) return { top: ['soc', 'phone'], rest: ['tablet', 'laptop', 'cpu', 'gpu'] };
+    if (/nvidia|rtx|gtx|radeon|rx\s*[0-9]|geforce|arc\s*a[0-9]/i.test(q)) return { top: ['gpu', 'laptop'], rest: ['cpu', 'phone', 'tablet', 'soc'] };
+    if (/iphone|galaxy\s*s|pixel\s*[0-9]|oneplus|xiaomi|redmi|poco|realme|nothing\s*phone/i.test(q)) return { top: ['phone', 'soc'], rest: ['tablet', 'laptop', 'cpu', 'gpu'] };
+    if (/ipad|galaxy\s*tab|surface\s*pro|tab\s*s[0-9]/i.test(q)) return { top: ['tablet', 'phone'], rest: ['soc', 'laptop', 'cpu', 'gpu'] };
+    if (/macbook|thinkpad|xps|zenbook|vivobook|chromebook|ultrabook/i.test(q)) return { top: ['laptop', 'cpu'], rest: ['gpu', 'tablet', 'phone', 'soc'] };
+    return { top: ['phone', 'laptop'], rest: ['tablet', 'soc', 'cpu', 'gpu'] };
 };
 
 function scoreMatch(name, slug, q) {
@@ -73,112 +66,151 @@ function dedupeAndSort(results, query) {
         });
 }
 
-/**
- * Search: try direct HTTP first (with CF cookies if available), then browser.
- * Direct HTTP is ~10-20x faster than browser.
- */
-async function fastSearch(query, limit = 10) {
-    const types = detectLikelyTypes(query);
-    const cookies = await getCFCookies() || '';
-
-    try {
-        const results = await directSearch(query, limit, types, cookies);
-        if (results.length > 0) {
-            console.log(`[search] Direct HTTP OK (${results.length} results)`);
-            return results;
-        }
-        console.log('[search] Direct HTTP returned 0 results, trying browser...');
-    } catch (err) {
-        console.log('[search] Direct HTTP failed:', err.message, '— using browser');
-    }
-
-    return browserSearchDirect(query, limit, types);
-}
-
-/**
- * Fetch device HTML: try direct HTTP first (with CF cookies), then browser.
- */
-async function fastFetchHtml(url) {
-    const cookies = await getCFCookies() || '';
-    try {
-        const html = await directFetchHtml(url, cookies, 6000);
-        console.log('[html] Direct HTTP OK');
-        return html;
-    } catch (err) {
-        console.log('[html] Direct HTTP failed:', err.message, '— using browser');
-        return browserFetchDirect(url);
-    }
-}
-
 function buildDeviceUrl(item) {
-    if (item.slug)
-        return `https://nanoreview.net/en/${item.content_type}/${item.slug}`;
-    if (item.url_name)
-        return `https://nanoreview.net/en/${item.content_type}/${item.url_name}`;
-    if (item.url?.startsWith('http'))
-        return item.url;
-    if (item.url)
-        return `https://nanoreview.net${item.url}`;
-    const slug = item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    const slug = item.slug || item.url_name ||
+        item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    if (item.url?.startsWith('http')) return item.url;
+    if (item.url) return `https://nanoreview.net${item.url}`;
     return `https://nanoreview.net/en/${item.content_type}/${slug}`;
 }
 
+function formatSearchResults(deduped) {
+    return deduped.map((r, i) => ({
+        index: i, name: r.name, type: r.content_type,
+        slug: r.slug || r.url_name || r.url || null,
+    }));
+}
+
+async function getHttp(url, cookies) {
+    try { return await directFetchHtml(url, cookies || '', 6000); } catch { return null; }
+}
+
 /**
- * MAIN: searchAndFetch
- * Runs search + device page fetch in parallel when possible.
+ * PIPELINE: Race top types, kick off page fetch the instant we have a slug.
+ * Top-2 types fire first. If they return a result before all-types finishes,
+ * we immediately start fetching the device page in parallel.
  */
 export const searchAndFetch = async (query, limit = 10) => {
     const cacheKey = `full:${query.toLowerCase()}`;
     const cached = cache.get('device', cacheKey);
     if (cached) return cached;
 
-    // Search to get the device slug/URL
-    const rawResults = await fastSearch(query, limit);
-    if (!rawResults.length) return null;
+    const cookies = await getCFCookies() || '';
+    const { top, rest } = detectTypes(query);
+    const allTypes = [...top, ...rest];
 
-    const deduped = dedupeAndSort(rawResults, query);
-    const item = pickBestMatch(deduped, query);
-    console.log('[search] picked:', item.name, '→', item.content_type);
+    // --- FAST PIPELINE ---
+    // We race the search against itself: top-2 types finish ~2x faster.
+    // The moment top-2 returns something good, we start the page fetch.
+    // Meanwhile all-types keeps running in case top-2 misses.
 
-    const deviceUrl = buildDeviceUrl(item);
-    console.log('[search] URL:', deviceUrl);
+    let deviceFetchPromise = null;
+    let resolvedItem = null;
+    let allDeduped = null;
 
-    // Check device-level cache
-    const deviceCached = cache.get('device', deviceUrl);
-    if (deviceCached) {
-        deviceCached.searchResults = formatSearchResults(deduped);
-        deviceCached.matchedDevice = item.name;
-        return deviceCached;
+    const runSearch = async (types) => {
+        try {
+            return await directSearch(query, limit, types, cookies);
+        } catch {
+            return [];
+        }
+    };
+
+    // Fire top-2 and all-types simultaneously
+    const topPromise = runSearch(top);
+    const allPromise = runSearch(allTypes);
+
+    // As soon as top-2 comes back with a result, start page fetch immediately
+    const topResults = await topPromise;
+    if (topResults.length > 0) {
+        const deduped = dedupeAndSort(topResults, query);
+        const item = pickBestMatch(deduped, query);
+        const url = buildDeviceUrl(item);
+        const devCached = cache.get('device', url);
+        if (devCached) {
+            // Already cached — cancel everything, return immediately
+            devCached.searchResults = formatSearchResults(deduped);
+            devCached.matchedDevice = item.name;
+            return devCached;
+        }
+        // Kick off page fetch NOW, in parallel with all-types still running
+        console.log(`[pipeline] Top-2 hit → pre-fetching ${url}`);
+        deviceFetchPromise = getHttp(url, cookies);
+        resolvedItem = item;
     }
 
-    // Fetch device HTML
-    const html = await fastFetchHtml(deviceUrl);
+    // Wait for all-types to finish (for better deduplication/sorting)
+    const allResults = await allPromise;
+    const merged = dedupeAndSort([...allResults, ...topResults], query);
+    const finalItem = pickBestMatch(merged, query) || resolvedItem;
+
+    if (!finalItem) {
+        // All direct HTTP failed — fall back to browser for both search and fetch
+        console.log('[pipeline] All direct HTTP failed, using browser...');
+        const browserResults = await browserSearchDirect(query, limit, allTypes);
+        if (!browserResults.length) return null;
+        const bDeduped = dedupeAndSort(browserResults, query);
+        const bItem = pickBestMatch(bDeduped, query);
+        const bUrl = buildDeviceUrl(bItem);
+        const bDevCached = cache.get('device', bUrl);
+        if (bDevCached) {
+            bDevCached.searchResults = formatSearchResults(bDeduped);
+            bDevCached.matchedDevice = bItem.name;
+            return bDevCached;
+        }
+        const bHtml = await browserFetchDirect(bUrl);
+        const bData = parseDeviceHtml(bHtml, bUrl);
+        bData.searchResults = formatSearchResults(bDeduped);
+        bData.matchedDevice = bItem.name;
+        cache.set('device', bUrl, bData, TTL.device);
+        cache.set('device', cacheKey, bData, TTL.device);
+        return bData;
+    }
+
+    const deviceUrl = buildDeviceUrl(finalItem);
+    console.log('[pipeline] final URL:', deviceUrl);
+
+    // Check cache again with final URL
+    const devCachedFinal = cache.get('device', deviceUrl);
+    if (devCachedFinal) {
+        devCachedFinal.searchResults = formatSearchResults(merged);
+        devCachedFinal.matchedDevice = finalItem.name;
+        return devCachedFinal;
+    }
+
+    // If we already started fetching (from top-2 result), reuse that promise if URL matches
+    // Otherwise start a fresh fetch for the final URL
+    let html = null;
+    if (deviceFetchPromise && resolvedItem && buildDeviceUrl(resolvedItem) === deviceUrl) {
+        html = await deviceFetchPromise;
+    }
+    if (!html) {
+        html = await getHttp(deviceUrl, cookies);
+    }
+    if (!html) {
+        console.log('[pipeline] Direct HTML fetch failed, browser fallback...');
+        html = await browserFetchDirect(deviceUrl);
+    }
+
     const data = parseDeviceHtml(html, deviceUrl);
-    data.searchResults = formatSearchResults(deduped);
-    data.matchedDevice = item.name;
+    data.searchResults = formatSearchResults(merged);
+    data.matchedDevice = finalItem.name;
 
     cache.set('device', deviceUrl, data, TTL.device);
     cache.set('device', cacheKey, data, TTL.device);
     return data;
 };
 
-function formatSearchResults(deduped) {
-    return deduped.map((r, i) => ({
-        index: i,
-        name: r.name,
-        type: r.content_type,
-        slug: r.slug || r.url_name || r.url || null,
-    }));
-}
-
+/**
+ * Fast regex extraction of __NEXT_DATA__ — avoids full cheerio parse for the happy path.
+ * Falls back to cheerio only if regex fails.
+ */
 function parseDeviceHtml(html, url) {
-    const $ = cheerio.load(html);
-
-    // __NEXT_DATA__ is the richest, fastest parse path
+    // Fast path: regex extract __NEXT_DATA__ JSON without loading full DOM
     try {
-        const raw = $('#__NEXT_DATA__').html();
-        if (raw) {
-            const next = JSON.parse(raw);
+        const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([^<]+)<\/script>/);
+        if (m) {
+            const next = JSON.parse(m[1]);
             const props = next?.props?.pageProps;
             const d = props?.device || props?.phone || props?.item || props?.data || props?.pageData;
             if (d?.name) {
@@ -196,6 +228,8 @@ function parseDeviceHtml(html, url) {
         }
     } catch {}
 
+    // Slow path: full DOM parse
+    const $ = cheerio.load(html);
     const title = $('h1').first().text().trim();
     const data = { title, sourceUrl: url, images: [], scores: {}, pros: [], cons: [], specs: {} };
 
@@ -233,14 +267,22 @@ function parseDeviceHtml(html, url) {
     return data;
 }
 
-// ── searchDevices ──────────────────────────────────────────────────────────
+// ── Other exports ──────────────────────────────────────────────────────────
 
 export const searchDevices = async (query, limit = 10) => {
     const cacheKey = `search:${query.toLowerCase()}-${limit}`;
     const cached = cache.get('search', cacheKey);
     if (cached) return cached;
 
-    const results = await fastSearch(query, limit);
+    const cookies = await getCFCookies() || '';
+    const { top, rest } = detectTypes(query);
+    let results = [];
+    try {
+        results = await directSearch(query, limit, [...top, ...rest], cookies);
+    } catch {}
+    if (!results.length) {
+        results = await browserSearchDirect(query, limit, [...top, ...rest]);
+    }
     const deduped = dedupeAndSort(results, query);
     cache.set('search', cacheKey, deduped, TTL.search);
     return deduped;
@@ -249,7 +291,9 @@ export const searchDevices = async (query, limit = 10) => {
 export const scrapeDevicePage = async (deviceUrl) => {
     const cached = cache.get('device', deviceUrl);
     if (cached) return cached;
-    const html = await fastFetchHtml(deviceUrl);
+    const cookies = await getCFCookies() || '';
+    let html = await getHttp(deviceUrl, cookies);
+    if (!html) html = await browserFetchDirect(deviceUrl);
     const data = parseDeviceHtml(html, deviceUrl);
     cache.set('device', deviceUrl, data, TTL.device);
     return data;
@@ -258,7 +302,9 @@ export const scrapeDevicePage = async (deviceUrl) => {
 export const scrapeComparePage = async (compareUrl) => {
     const cached = cache.get('compare', compareUrl);
     if (cached) return cached;
-    const html = await fastFetchHtml(compareUrl);
+    const cookies = await getCFCookies() || '';
+    let html = await getHttp(compareUrl, cookies);
+    if (!html) html = await browserFetchDirect(compareUrl);
     const $ = cheerio.load(html);
     const data = { title: $('h1').first().text().trim(), sourceUrl: compareUrl, device1: { name: '' }, device2: { name: '' }, comparisons: {} };
     const headers = [];
@@ -284,7 +330,9 @@ export const scrapeComparePage = async (compareUrl) => {
 export const scrapeRankingPage = async (rankingUrl) => {
     const cached = cache.get('ranking', rankingUrl);
     if (cached) return cached;
-    const html = await fastFetchHtml(rankingUrl);
+    const cookies = await getCFCookies() || '';
+    let html = await getHttp(rankingUrl, cookies);
+    if (!html) html = await browserFetchDirect(rankingUrl);
     const $ = cheerio.load(html);
     const data = { title: $('h1').first().text().trim(), sourceUrl: rankingUrl, rankings: [] };
     const headers = [];

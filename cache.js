@@ -1,139 +1,114 @@
 /**
- * cache.js - Two-tier cache: in-memory (fast) + file-based (persistent across restarts)
- * TTLs: search=1h, device=6h, compare=6h, ranking=24h
+ * cache.js - Pure in-memory LRU cache with async file persistence
+ *
+ * File cache reads are async and non-blocking.
+ * On startup, preloads all valid file cache entries into memory.
  */
 import fs from 'fs';
+import fsp from 'fs/promises';
 import path from 'path';
 import { createHash } from 'crypto';
 
 const CACHE_DIR = process.env.CACHE_DIR || path.join(process.cwd(), '.cache');
-const MEM_MAX = 500; // max in-memory entries
+const MEM_MAX = 1000;
 
-// TTLs in ms
 export const TTL = {
-    search: 60 * 60 * 1000,        // 1 hour
-    device: 6 * 60 * 60 * 1000,    // 6 hours
-    compare: 6 * 60 * 60 * 1000,   // 6 hours
-    ranking: 24 * 60 * 60 * 1000,  // 24 hours
-    http: 10 * 60 * 1000,           // 10 min for raw HTTP API responses
+    search:  60 * 60 * 1000,        // 1h
+    device:  6  * 60 * 60 * 1000,   // 6h
+    compare: 6  * 60 * 60 * 1000,   // 6h
+    ranking: 24 * 60 * 60 * 1000,   // 24h
+    http:    10 * 60 * 1000,         // 10m
 };
 
-// In-memory LRU-ish store
-const memCache = new Map();
+// Pure in-memory LRU (Map preserves insertion order, delete+re-insert = move to tail)
+const mem = new Map();
 
-function ensureCacheDir() {
-    if (!fs.existsSync(CACHE_DIR)) {
-        fs.mkdirSync(CACHE_DIR, { recursive: true });
+function evict() {
+    if (mem.size >= MEM_MAX) {
+        mem.delete(mem.keys().next().value);
     }
 }
 
-function cacheKey(namespace, key) {
-    const hash = createHash('md5').update(key).digest('hex');
-    return `${namespace}_${hash}`;
+function ckey(namespace, key) {
+    return `${namespace}_${createHash('md5').update(key).digest('hex')}`;
 }
 
-function filePath(k) {
+function fpath(k) {
     return path.join(CACHE_DIR, `${k}.json`);
 }
 
-// Evict oldest entries if memory cache too big
-function evictMem() {
-    if (memCache.size >= MEM_MAX) {
-        const oldestKey = memCache.keys().next().value;
-        memCache.delete(oldestKey);
-    }
+// Preload file cache into memory on startup (async, non-blocking)
+async function preload() {
+    try {
+        await fsp.mkdir(CACHE_DIR, { recursive: true });
+        const files = await fsp.readdir(CACHE_DIR);
+        let loaded = 0;
+        await Promise.all(files.map(async (f) => {
+            try {
+                const raw = await fsp.readFile(path.join(CACHE_DIR, f), 'utf8');
+                const entry = JSON.parse(raw);
+                if (Date.now() < entry.expires) {
+                    const k = f.replace('.json', '');
+                    evict();
+                    mem.set(k, entry);
+                    loaded++;
+                } else {
+                    fsp.unlink(path.join(CACHE_DIR, f)).catch(() => {});
+                }
+            } catch {}
+        }));
+        if (loaded > 0) console.log(`[cache] Preloaded ${loaded} entries from disk`);
+    } catch {}
 }
+
+// Fire and forget preload
+preload();
 
 export const cache = {
     get(namespace, key) {
-        const k = cacheKey(namespace, key);
-        
-        // Check memory first
-        const mem = memCache.get(k);
-        if (mem) {
-            if (Date.now() < mem.expires) {
-                return mem.value;
-            }
-            memCache.delete(k);
+        const k = ckey(namespace, key);
+        const entry = mem.get(k);
+        if (!entry) return null;
+        if (Date.now() >= entry.expires) {
+            mem.delete(k);
+            fsp.unlink(fpath(k)).catch(() => {});
+            return null;
         }
-
-        // Check file cache
-        try {
-            const fp = filePath(k);
-            if (fs.existsSync(fp)) {
-                const raw = fs.readFileSync(fp, 'utf8');
-                const entry = JSON.parse(raw);
-                if (Date.now() < entry.expires) {
-                    // Warm memory cache
-                    evictMem();
-                    memCache.set(k, entry);
-                    return entry.value;
-                }
-                // Expired - delete async
-                fs.unlink(fp, () => {});
-            }
-        } catch {}
-
-        return null;
+        // LRU: move to tail
+        mem.delete(k);
+        mem.set(k, entry);
+        return entry.value;
     },
 
     set(namespace, key, value, ttl) {
-        const k = cacheKey(namespace, key);
+        const k = ckey(namespace, key);
         const entry = { value, expires: Date.now() + ttl };
-        
-        // Memory
-        evictMem();
-        memCache.set(k, entry);
-
-        // File (async, non-blocking)
-        try {
-            ensureCacheDir();
-            fs.writeFile(filePath(k), JSON.stringify(entry), () => {});
-        } catch {}
+        evict();
+        mem.set(k, entry);
+        // Persist async
+        fsp.mkdir(CACHE_DIR, { recursive: true })
+            .then(() => fsp.writeFile(fpath(k), JSON.stringify(entry)))
+            .catch(() => {});
     },
 
     del(namespace, key) {
-        const k = cacheKey(namespace, key);
-        memCache.delete(k);
-        try { fs.unlink(filePath(k), () => {}); } catch {}
+        const k = ckey(namespace, key);
+        mem.delete(k);
+        fsp.unlink(fpath(k)).catch(() => {});
     },
 
-    // Stats for /health endpoint
     stats() {
-        let fileCount = 0;
-        try {
-            ensureCacheDir();
-            fileCount = fs.readdirSync(CACHE_DIR).length;
-        } catch {}
-        return { memEntries: memCache.size, fileEntries: fileCount };
+        return { memEntries: mem.size };
     },
-
-    // Clean expired file entries (run periodically)
-    sweep() {
-        try {
-            ensureCacheDir();
-            const files = fs.readdirSync(CACHE_DIR);
-            let cleaned = 0;
-            for (const f of files) {
-                try {
-                    const fp = path.join(CACHE_DIR, f);
-                    const raw = fs.readFileSync(fp, 'utf8');
-                    const entry = JSON.parse(raw);
-                    if (Date.now() >= entry.expires) {
-                        fs.unlinkSync(fp);
-                        cleaned++;
-                    }
-                } catch {
-                    // Remove corrupt files
-                    try { fs.unlinkSync(path.join(CACHE_DIR, f)); } catch {}
-                }
-            }
-            return cleaned;
-        } catch {
-            return 0;
-        }
-    }
 };
 
-// Sweep expired entries every 30 minutes
-setInterval(() => cache.sweep(), 30 * 60 * 1000).unref();
+// Periodic sweep of expired memory entries (every 10 min)
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of mem) {
+        if (now >= v.expires) {
+            mem.delete(k);
+            fsp.unlink(fpath(k)).catch(() => {});
+        }
+    }
+}, 10 * 60 * 1000).unref();

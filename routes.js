@@ -19,11 +19,14 @@ export const setupRoutes = (fastify) => {
         const t0 = Date.now();
         try {
             if (index !== undefined) {
-                // Index mode: search first, then fetch by index
+                // Use searchAndFetch to get results+page in one shot, but for a specific index
+                // First do a search to know which device is at that index
                 const results = await searchDevices(q, 10);
                 if (!results?.length) return reply.status(404).send({ success: false, error: 'No devices found' });
-                const item = results[Math.min(parseInt(index, 10) || 0, results.length - 1)];
+                const idx = Math.min(parseInt(index, 10) || 0, results.length - 1);
+                const item = results[idx];
                 const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${getSlug(item)}`;
+                // scrapeDevicePage is cached separately — fast if already visited
                 const data = await scrapeDevicePage(deviceUrl);
                 data.matchedQuery = q;
                 data.matchedDevice = item.name;
@@ -32,7 +35,6 @@ export const setupRoutes = (fastify) => {
                 return reply.send({ success: true, contentType: 'device_details', data });
             }
 
-            // Normal mode: optimized single call
             const data = await searchAndFetch(q, 10);
             if (!data) return reply.status(404).send({ success: false, error: 'No devices found' });
             data.matchedQuery = q;
@@ -48,11 +50,12 @@ export const setupRoutes = (fastify) => {
         if (!q1 || !q2) return reply.status(400).send({ success: false, error: 'q1 and q2 required' });
         const t0 = Date.now();
         try {
-            // Search both in parallel
             const [r1, r2] = await Promise.all([searchDevices(q1, 5), searchDevices(q2, 5)]);
             if (!r1.length || !r2.length) return reply.status(404).send({ success: false, error: 'Device(s) not found' });
             const item1 = pickBestMatch(r1, q1), item2 = pickBestMatch(r2, q2);
-            const data = await scrapeComparePage(`https://nanoreview.net/en/${item1.content_type}-compare/${getSlug(item1)}-vs-${getSlug(item2)}`);
+            const data = await scrapeComparePage(
+                `https://nanoreview.net/en/${item1.content_type}-compare/${getSlug(item1)}-vs-${getSlug(item2)}`
+            );
             data._ms = Date.now() - t0;
             return reply.send({ success: true, contentType: 'comparison', data });
         } catch (err) {
@@ -66,8 +69,14 @@ export const setupRoutes = (fastify) => {
         const t0 = Date.now();
         try {
             const results = await searchDevices(q, 10);
-            return reply.send({ success: true, contentType: 'suggestions', _ms: Date.now() - t0,
-                data: results.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: getSlug(r), url: `https://nanoreview.net/en/${r.content_type}/${getSlug(r)}` })) });
+            return reply.send({
+                success: true, contentType: 'suggestions', _ms: Date.now() - t0,
+                data: results.map((r, i) => ({
+                    index: i, name: r.name, type: r.content_type,
+                    slug: getSlug(r),
+                    url: `https://nanoreview.net/en/${r.content_type}/${getSlug(r)}`,
+                })),
+            });
         } catch (err) {
             return reply.status(500).send({ success: false, error: err.message });
         }
