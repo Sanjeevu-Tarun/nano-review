@@ -1,29 +1,29 @@
 /**
- * browser.js - Persistent browser with CF cookie extraction + page pool
+ * browser.js - Persistent browser with warmup gate + CF cookie extraction
  *
- * KEY INSIGHT: After warmup, extract CF cookies and use them for direct HTTP.
- * Only use browser as last resort — direct HTTP with CF cookies is 10x faster.
+ * COLD START FIX:
+ * - warmUpPromise is set immediately on module load
+ * - First request awaits warmUpPromise before proceeding
+ * - Subsequent requests skip the gate (warmup done)
+ * - Self keep-alive in server.js prevents Render from sleeping
  */
 import { chromium as playwrightLocal } from 'playwright';
 
 let _browser = null;
 let _context = null;
 let _launching = null;
-let _cfCookies = null; // Cached CF cookies for direct HTTP use
+let _cfCookies = null;
 let _cfCookieExpiry = 0;
+let _warmUpDone = false;
+let _warmUpPromise = null;
 
 const pagePool = [];
 const PAGE_POOL_SIZE = 3;
-
-// Resource blocking filter
 const BLOCKED_TYPES = new Set(['font', 'media', 'image', 'stylesheet']);
 
 async function applyPageOptimizations(page) {
     await page.route('**/*', route => {
-        if (BLOCKED_TYPES.has(route.request().resourceType()))
-            route.abort();
-        else
-            route.continue();
+        BLOCKED_TYPES.has(route.request().resourceType()) ? route.abort() : route.continue();
     });
 }
 
@@ -57,9 +57,7 @@ export async function returnPage(page) {
         } else {
             await page.close().catch(() => {});
         }
-    } catch {
-        await page.close().catch(() => {});
-    }
+    } catch { await page.close().catch(() => {}); }
 }
 
 export async function getPersistentContext() {
@@ -99,13 +97,16 @@ export async function getPersistentContext() {
         });
 
         _browser.on('disconnected', () => {
-            console.log('[browser] Disconnected');
+            console.log('[browser] Disconnected — relaunching...');
             _browser = null; _context = null; _launching = null;
             _cfCookies = null; _cfCookieExpiry = 0;
+            _warmUpDone = false;
             pagePool.length = 0;
+            // Auto re-warmup on disconnect
+            warmUp().catch(() => {});
         });
 
-        console.log('[browser] Ready');
+        console.log('[browser] Launched');
         _launching = null;
         return _context;
     })();
@@ -113,57 +114,65 @@ export async function getPersistentContext() {
     return _launching;
 }
 
-/**
- * Get CF cookies for direct HTTP requests.
- * Returns cookie string like "cf_clearance=xxx; __cf_bm=yyy"
- */
-export async function getCFCookies() {
-    if (_cfCookies && Date.now() < _cfCookieExpiry) return _cfCookies;
-    return null; // Not available yet
-}
-
-/**
- * Update CF cookies after a successful browser navigation.
- */
 async function refreshCFCookies() {
     if (!_context) return;
     try {
         const cookies = await _context.cookies('https://nanoreview.net');
-        const cfCookies = cookies.filter(c =>
-            c.name.startsWith('cf_') || c.name.startsWith('__cf') || c.name === '_cfuvid'
-        );
-        if (cfCookies.length > 0) {
-            _cfCookies = cfCookies.map(c => `${c.name}=${c.value}`).join('; ');
-            _cfCookieExpiry = Date.now() + 25 * 60 * 1000; // 25 min
-            console.log('[browser] CF cookies updated:', cfCookies.map(c => c.name).join(', '));
+        const cf = cookies.filter(c => c.name.startsWith('cf_') || c.name.startsWith('__cf') || c.name === '_cfuvid');
+        if (cf.length > 0) {
+            _cfCookies = cf.map(c => `${c.name}=${c.value}`).join('; ');
+            _cfCookieExpiry = Date.now() + 25 * 60 * 1000;
+            console.log('[browser] CF cookies:', cf.map(c => c.name).join(', '));
         }
     } catch {}
 }
 
+export async function getCFCookies() {
+    if (_cfCookies && Date.now() < _cfCookieExpiry) return _cfCookies;
+    return null;
+}
+
+/**
+ * Wait for warmup to complete before handling requests.
+ * Only the first few requests block — after that it's instant.
+ */
+export async function awaitWarmUp() {
+    if (_warmUpDone) return;
+    if (_warmUpPromise) return _warmUpPromise;
+    return; // warmup not started yet (shouldn't happen)
+}
+
+export function setWarmUpDone() {
+    _warmUpDone = true;
+}
+
 export async function warmUp() {
     console.log('[browser] Warming up...');
-    await getPersistentContext();
-    const page = await getPooledPage();
-    try {
-        await page.goto('https://nanoreview.net/en/', {
-            waitUntil: 'domcontentloaded',
-            timeout: 25000,
-        });
-        await waitForCloudflare(page, 12000);
-        await refreshCFCookies();
-        console.log('[browser] Warm-up complete, CF cookies captured');
-    } finally {
-        await returnPage(page);
-    }
-    await fillPagePool();
-    console.log(`[browser] Pool ready (${pagePool.length} pages)`);
+    _warmUpPromise = (async () => {
+        await getPersistentContext();
+        const page = await getPooledPage();
+        try {
+            await page.goto('https://nanoreview.net/en/', {
+                waitUntil: 'domcontentloaded',
+                timeout: 30000,
+            });
+            await waitForCloudflare(page, 15000);
+            await refreshCFCookies();
+            console.log('[browser] Warm-up complete');
+        } finally {
+            await returnPage(page);
+        }
+        await fillPagePool();
+        _warmUpDone = true;
+        console.log(`[browser] Ready. Pool: ${pagePool.length} pages. CF cookies: ${!!_cfCookies}`);
+    })();
+    return _warmUpPromise;
 }
 
 export async function waitForCloudflare(page, timeout = 12000) {
     try {
         const title = await page.title();
-        if (!/just a moment|attention required|cloudflare|checking your browser/i.test(title))
-            return true;
+        if (!/just a moment|attention required|cloudflare|checking your browser/i.test(title)) return true;
     } catch { return true; }
 
     const start = Date.now();
@@ -171,10 +180,9 @@ export async function waitForCloudflare(page, timeout = 12000) {
         try {
             const title = await page.title();
             const url = page.url();
-            const isChallenge = /just a moment|attention required|cloudflare|checking your browser/i.test(title);
-            const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
-            if (!isChallenge && !isChallengeUrl) {
-                await refreshCFCookies(); // Capture cookies as soon as CF clears
+            if (!/just a moment|attention required|cloudflare|checking your browser/i.test(title)
+                && !/cdn-cgi|challenge-platform/i.test(url)) {
+                await refreshCFCookies();
                 return true;
             }
             await page.waitForTimeout(300);
@@ -193,11 +201,11 @@ export async function safeNavigate(page, url, options = {}) {
     }
 }
 
-/**
- * Fetch HTML using browser — goes directly to target URL (no homepage warmup needed
- * since CF cookies are already in the context from warmup).
- */
 export async function browserFetchDirect(url) {
+    // Wait for warmup if not done — ensures CF cookies exist before we try
+    if (!_warmUpDone && _warmUpPromise) {
+        await _warmUpPromise.catch(() => {});
+    }
     const page = await getPooledPage();
     try {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
@@ -208,24 +216,17 @@ export async function browserFetchDirect(url) {
     }
 }
 
-/**
- * Run search API calls directly inside the browser context.
- * Faster than navigating to homepage first — reuses existing CF session.
- */
 export async function browserSearchDirect(query, limit, types) {
+    if (!_warmUpDone && _warmUpPromise) {
+        await _warmUpPromise.catch(() => {});
+    }
     const page = await getPooledPage();
     try {
-        // Go directly to a lightweight page (or reuse current) and run fetch from there
-        // If page is at about:blank, navigate to nanoreview first
         const currentUrl = page.url();
         if (!currentUrl.includes('nanoreview.net')) {
-            await page.goto('https://nanoreview.net/en/', {
-                waitUntil: 'domcontentloaded',
-                timeout: 20000,
-            });
+            await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
             await waitForCloudflare(page, 8000);
         }
-
         return await page.evaluate(async ({ query, limit, types }) => {
             const all = await Promise.all(types.map(async type => {
                 try {
@@ -244,8 +245,3 @@ export async function browserSearchDirect(query, limit, types) {
         await returnPage(page);
     }
 }
-
-export const getBrowserContext = async () => ({
-    browser: _browser || await getPersistentContext().then(() => _browser),
-    context: await getPersistentContext(),
-});
