@@ -1,6 +1,7 @@
 import * as cheerio from 'cheerio';
 import { getPooledPage, waitForCloudflare, safeNavigate } from './browser.js';
 import { cache, TTL } from './cache.js';
+import { directSearch, directFetchHtml } from './http.js';
 
 const detectLikelyTypes = (query) => {
     const q = query.toLowerCase();
@@ -44,171 +45,151 @@ export function pickBestMatch(results, query) {
 }
 
 /**
- * THE KEY FIX:
- * Nanoreview's JSON search API sometimes returns items with no slug field.
- * Instead of guessing the slug from the name, we do ONE browser navigation
- * to nanoreview.net/en/ and then:
- * 1. Call search JSON API via fetch() — gets name + type (+ slug if available)
- * 2. Intercept the actual page navigation to get the REAL URL with slug
- * 3. Navigate directly to the device page in the same tab
- * 4. Extract HTML — all in ONE page, ONE CF pass
+ * Fast path: try direct HTTP first (no browser), fall back to browser only if CF blocks.
+ */
+async function fetchHtmlFast(url) {
+    try {
+        const html = await directFetchHtml(url, 6000);
+        console.log('[fetch] Direct HTTP success:', url);
+        return html;
+    } catch (err) {
+        console.log('[fetch] Direct HTTP failed, falling back to browser:', err.message);
+    }
+    return browserFetchHtml(url);
+}
+
+/**
+ * Fast search: direct HTTP API (no browser).
+ * Falls back to browser only if blocked by CF.
+ */
+async function fastSearch(query, limit = 10) {
+    const types = detectLikelyTypes(query);
+
+    try {
+        const results = await directSearch(query, limit, types);
+        if (results.length > 0) {
+            console.log('[search] Direct HTTP search succeeded, count:', results.length);
+            return results;
+        }
+    } catch (err) {
+        console.log('[search] Direct HTTP search failed:', err.message);
+    }
+
+    console.log('[search] Falling back to browser search...');
+    return browserSearch(query, limit, types);
+}
+
+async function browserSearch(query, limit, types) {
+    const page = await getPooledPage();
+    try {
+        await safeNavigate(page, 'https://nanoreview.net/en/');
+        await waitForCloudflare(page, 10000);
+
+        const results = await page.evaluate(async ({ query, limit, types }) => {
+            const all = await Promise.all(types.map(async type => {
+                try {
+                    const r = await fetch(`https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`, { headers: { Accept: 'application/json' } });
+                    if (!r.ok) return [];
+                    const d = await r.json();
+                    return Array.isArray(d) ? d.map(x => ({ ...x, content_type: x.content_type || type })) : [];
+                } catch { return []; }
+            }));
+            return all.flat();
+        }, { query, limit, types });
+
+        return results;
+    } finally {
+        await page.close().catch(() => {});
+    }
+}
+
+/**
+ * MAIN EXPORT: searchAndFetch
+ *
+ * SPEED STRATEGY:
+ * 1. Check cache — instant
+ * 2. directSearch() — pure HTTP, no browser (~100-300ms)
+ * 3. Build device URL from slug
+ * 4. directFetchHtml() for device page — no browser (~200-500ms)
+ * 5. Fall back to browser only if CF blocks
+ *
+ * Total target: <800ms uncached, <5ms cached
  */
 export const searchAndFetch = async (query, limit = 10) => {
     const cacheKey = `full:${query.toLowerCase()}`;
     const cached = cache.get('device', cacheKey);
     if (cached) return cached;
 
-    const types = detectLikelyTypes(query);
-    const page = await getPooledPage();
+    // Step 1: Search
+    const searchResults = await fastSearch(query, limit);
 
-    try {
-        // Navigate to nanoreview — pass CF once
-        await safeNavigate(page, 'https://nanoreview.net/en/');
-        await waitForCloudflare(page, 10000);
+    console.log('[search] results count:', searchResults.length);
+    if (!searchResults.length) return null;
 
-        // Step 1: Search API — get all results including real slugs
-        // We intercept ALL fetch/XHR responses to capture search API responses
-        const searchResults = await page.evaluate(async ({ query, limit, types }) => {
-            const results = [];
+    // Dedupe and sort
+    const seen = new Set();
+    const deduped = searchResults.filter(r => {
+        const key = r.slug || r.url_name || r.url || r.id || r.name;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+    deduped.sort((a, b) => {
+        const sA = a.slug || a.url_name || a.url || '';
+        const sB = b.slug || b.url_name || b.url || '';
+        return scoreMatch(b.name, sB, query) - scoreMatch(a.name, sA, query);
+    });
 
-            await Promise.all(types.map(async (type) => {
-                try {
-                    const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
-                    const r = await fetch(url, { headers: { Accept: 'application/json' } });
-                    if (!r.ok) return;
-                    const data = await r.json();
-                    if (Array.isArray(data)) {
-                        data.forEach(item => {
-                            results.push({ ...item, content_type: item.content_type || type });
-                        });
-                    }
-                } catch {}
-            }));
+    const item = pickBestMatch(deduped, query);
+    console.log('[search] picked item:', JSON.stringify(item));
 
-            return results;
-        }, { query, limit, types });
+    // Step 2: Build device URL
+    let deviceUrl = null;
+    if (item.slug) {
+        deviceUrl = `https://nanoreview.net/en/${item.content_type}/${item.slug}`;
+    } else if (item.url_name) {
+        deviceUrl = `https://nanoreview.net/en/${item.content_type}/${item.url_name}`;
+    } else if (item.url && item.url.startsWith('http')) {
+        deviceUrl = item.url;
+    } else if (item.url) {
+        deviceUrl = `https://nanoreview.net${item.url}`;
+    } else {
+        const generatedSlug = item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+        deviceUrl = `https://nanoreview.net/en/${item.content_type}/${generatedSlug}`;
+        console.log('[search] Generated slug URL:', deviceUrl);
+    }
 
-        console.log('[search] results count:', searchResults.length);
-        if (searchResults.length > 0) {
-            console.log('[search] first item keys:', Object.keys(searchResults[0]));
-            console.log('[search] first item:', JSON.stringify(searchResults[0]));
-        }
+    console.log('[search] device URL:', deviceUrl);
 
-        if (!searchResults.length) return null;
-
-        // Dedupe and sort
-        const seen = new Set();
-        const deduped = searchResults.filter(r => {
-            // Use any available identifier to dedupe
-            const key = r.slug || r.url_name || r.url || r.id || r.name;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-        deduped.sort((a, b) => {
-            const sA = a.slug || a.url_name || a.url || '';
-            const sB = b.slug || b.url_name || b.url || '';
-            return scoreMatch(b.name, sB, query) - scoreMatch(a.name, sA, query);
-        });
-
-        const item = pickBestMatch(deduped, query);
-        console.log('[search] picked item:', JSON.stringify(item));
-
-        // Step 2: Get the real device URL
-        // Priority: use slug/url_name if present, else navigate to search results page
-        // and extract the real href from the HTML
-        let deviceUrl = null;
-
-        if (item.slug) {
-            deviceUrl = `https://nanoreview.net/en/${item.content_type}/${item.slug}`;
-        } else if (item.url_name) {
-            deviceUrl = `https://nanoreview.net/en/${item.content_type}/${item.url_name}`;
-        } else if (item.url && item.url.startsWith('http')) {
-            deviceUrl = item.url;
-        } else if (item.url) {
-            deviceUrl = `https://nanoreview.net${item.url}`;
-        } else {
-            // No slug at all — navigate to search results page and extract real href
-            console.log('[search] No slug found, scraping search page for real URL...');
-
-            const searchPageUrl = `https://nanoreview.net/en/search?q=${encodeURIComponent(query)}`;
-            await safeNavigate(page, searchPageUrl);
-            await page.waitForTimeout(500);
-
-            const foundUrl = await page.evaluate((itemName) => {
-                // Look for a link whose text matches the device name
-                const links = [...document.querySelectorAll('a[href]')];
-                for (const link of links) {
-                    const text = link.textContent?.trim() || '';
-                    const href = link.getAttribute('href') || '';
-                    // Match by name similarity
-                    if (text.toLowerCase().includes(itemName.toLowerCase().split(' ').slice(-1)[0].toLowerCase())
-                        && (href.includes('/phone/') || href.includes('/tablet/') || href.includes('/laptop/')
-                            || href.includes('/cpu/') || href.includes('/gpu/') || href.includes('/soc/'))) {
-                        return href.startsWith('http') ? href : `https://nanoreview.net${href}`;
-                    }
-                }
-
-                // Fallback: grab first device link on page
-                for (const link of links) {
-                    const href = link.getAttribute('href') || '';
-                    if (/\/(phone|tablet|laptop|cpu|gpu|soc)\/[a-z0-9-]+/.test(href)) {
-                        return href.startsWith('http') ? href : `https://nanoreview.net${href}`;
-                    }
-                }
-                return null;
-            }, item.name);
-
-            if (foundUrl) {
-                deviceUrl = foundUrl;
-                console.log('[search] Found real URL from search page:', deviceUrl);
-            } else {
-                // Last resort: generate slug from name
-                const generatedSlug = item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-                deviceUrl = `https://nanoreview.net/en/${item.content_type}/${generatedSlug}`;
-                console.log('[search] Generated slug URL:', deviceUrl);
-            }
-        }
-
-        console.log('[search] device URL:', deviceUrl);
-
-        // Check cache
-        const deviceCached = cache.get('device', deviceUrl);
-        if (deviceCached) {
-            deviceCached.searchResults = deduped.map((r, i) => ({
-                index: i, name: r.name, type: r.content_type,
-                slug: r.slug || r.url_name || r.url || null,
-            }));
-            deviceCached.matchedDevice = item.name;
-            return deviceCached;
-        }
-
-        // Step 3: Navigate to device page in SAME tab (already past CF, instant load)
-        await safeNavigate(page, deviceUrl);
-        await page.waitForTimeout(300);
-
-        const html = await page.content();
-        const data = parseDeviceHtml(html, deviceUrl);
-
-        data.searchResults = deduped.map((r, i) => ({
+    // Check device cache
+    const deviceCached = cache.get('device', deviceUrl);
+    if (deviceCached) {
+        deviceCached.searchResults = deduped.map((r, i) => ({
             index: i, name: r.name, type: r.content_type,
             slug: r.slug || r.url_name || r.url || null,
         }));
-        data.matchedDevice = item.name;
-
-        cache.set('device', deviceUrl, data, TTL.device);
-        cache.set('device', cacheKey, data, TTL.device);
-        return data;
-
-    } finally {
-        await page.close().catch(() => {});
+        deviceCached.matchedDevice = item.name;
+        return deviceCached;
     }
+
+    // Step 3: Fetch device page HTML (direct HTTP, fallback browser)
+    const html = await fetchHtmlFast(deviceUrl);
+    const data = parseDeviceHtml(html, deviceUrl);
+
+    data.searchResults = deduped.map((r, i) => ({
+        index: i, name: r.name, type: r.content_type,
+        slug: r.slug || r.url_name || r.url || null,
+    }));
+    data.matchedDevice = item.name;
+
+    cache.set('device', deviceUrl, data, TTL.device);
+    cache.set('device', cacheKey, data, TTL.device);
+    return data;
 };
 
 function parseDeviceHtml(html, url) {
     const $ = cheerio.load(html);
 
-    // Try __NEXT_DATA__ (Next.js sites embed full data as JSON — no selector needed)
     try {
         const raw = $('#__NEXT_DATA__').html();
         if (raw) {
@@ -267,13 +248,12 @@ function parseDeviceHtml(html, url) {
     return data;
 }
 
-// ── Other scrapers (compare, ranking) ─────────────────────────────────────
+// ── Other scrapers ─────────────────────────────────────────────────────────
 
 async function browserFetchHtml(url) {
     const page = await getPooledPage();
     try {
         await safeNavigate(page, url);
-        await page.waitForTimeout(200);
         return await page.content();
     } finally {
         await page.close().catch(() => {});
@@ -285,34 +265,19 @@ export const searchDevices = async (query, limit = 10) => {
     const cached = cache.get('search', cacheKey);
     if (cached) return cached;
 
-    const types = detectLikelyTypes(query);
-    const page = await getPooledPage();
-    try {
-        await safeNavigate(page, 'https://nanoreview.net/en/');
-        await waitForCloudflare(page, 10000);
-        const results = await page.evaluate(async ({ query, limit, types }) => {
-            const all = await Promise.all(types.map(async type => {
-                try {
-                    const r = await fetch(`https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`, { headers: { Accept: 'application/json' } });
-                    if (!r.ok) return [];
-                    const d = await r.json();
-                    return Array.isArray(d) ? d.map(x => ({ ...x, content_type: x.content_type || type })) : [];
-                } catch { return []; }
-            }));
-            return all.flat();
-        }, { query, limit, types });
-        const seen = new Set();
-        const deduped = results.filter(r => { const k = r.slug || r.name; if (seen.has(k)) return false; seen.add(k); return true; });
-        deduped.sort((a, b) => scoreMatch(b.name, b.slug || '', query) - scoreMatch(a.name, a.slug || '', query));
-        cache.set('search', cacheKey, deduped, TTL.search);
-        return deduped;
-    } finally { await page.close().catch(() => {}); }
+    const results = await fastSearch(query, limit);
+
+    const seen = new Set();
+    const deduped = results.filter(r => { const k = r.slug || r.name; if (seen.has(k)) return false; seen.add(k); return true; });
+    deduped.sort((a, b) => scoreMatch(b.name, b.slug || '', query) - scoreMatch(a.name, a.slug || '', query));
+    cache.set('search', cacheKey, deduped, TTL.search);
+    return deduped;
 };
 
 export const scrapeDevicePage = async (deviceUrl) => {
     const cached = cache.get('device', deviceUrl);
     if (cached) return cached;
-    const html = await browserFetchHtml(deviceUrl);
+    const html = await fetchHtmlFast(deviceUrl);
     const data = parseDeviceHtml(html, deviceUrl);
     cache.set('device', deviceUrl, data, TTL.device);
     return data;
@@ -321,7 +286,7 @@ export const scrapeDevicePage = async (deviceUrl) => {
 export const scrapeComparePage = async (compareUrl) => {
     const cached = cache.get('compare', compareUrl);
     if (cached) return cached;
-    const html = await browserFetchHtml(compareUrl);
+    const html = await fetchHtmlFast(compareUrl);
     const $ = cheerio.load(html);
     const data = {
         title: $('h1').first().text().trim(), sourceUrl: compareUrl,
@@ -350,7 +315,7 @@ export const scrapeComparePage = async (compareUrl) => {
 export const scrapeRankingPage = async (rankingUrl) => {
     const cached = cache.get('ranking', rankingUrl);
     if (cached) return cached;
-    const html = await browserFetchHtml(rankingUrl);
+    const html = await fetchHtmlFast(rankingUrl);
     const $ = cheerio.load(html);
     const data = { title: $('h1').first().text().trim(), sourceUrl: rankingUrl, rankings: [] };
     const headers = [];
