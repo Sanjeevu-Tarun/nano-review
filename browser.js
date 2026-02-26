@@ -1,8 +1,11 @@
 /**
- * browser.js
- * Persistent browser singleton — launched ONCE, reused forever.
- * This only works on persistent servers (Railway, Render, VPS).
- * On Vercel (serverless) each request is a new process so this has no benefit.
+ * browser.js - Persistent browser singleton with page pool
+ *
+ * OPTIMIZATIONS:
+ * 1. Page pool — pre-open pages ready to use instantly (no newPage() overhead)
+ * 2. Parallel warm-up — passes CF and pre-opens pool pages simultaneously
+ * 3. CF check is instant — checks title once, doesn't poll if already clear
+ * 4. networkidle removed — domcontentloaded is faster and enough
  */
 import { chromium as playwrightLocal } from 'playwright';
 
@@ -10,15 +13,43 @@ let _browser = null;
 let _context = null;
 let _launching = null;
 
-export async function getPersistentContext() {
-    // If already ready, return immediately
-    if (_context && _browser.isConnected()) return _context;
+// Pool of pre-opened idle pages ready to use immediately
+const pagePool = [];
+const PAGE_POOL_SIZE = 3;
 
-    // If launching in progress, wait for it
+async function fillPagePool() {
+    while (pagePool.length < PAGE_POOL_SIZE) {
+        try {
+            const page = await _context.newPage();
+            await page.route('**/*', route => {
+                if (['font', 'media', 'image', 'stylesheet'].includes(route.request().resourceType()))
+                    route.abort();
+                else route.continue();
+            });
+            pagePool.push(page);
+        } catch { break; }
+    }
+}
+
+export async function getPooledPage() {
+    // Return a pre-opened page instantly if available
+    if (pagePool.length > 0) {
+        const page = pagePool.shift();
+        // Refill pool in background
+        fillPagePool().catch(() => {});
+        return page;
+    }
+    // Pool empty — open a new one
+    const context = await getPersistentContext();
+    return context.newPage();
+}
+
+export async function getPersistentContext() {
+    if (_context && _browser?.isConnected()) return _context;
     if (_launching) return _launching;
 
     _launching = (async () => {
-        console.log('[browser] Launching persistent browser...');
+        console.log('[browser] Launching...');
         _browser = await playwrightLocal.launch({
             headless: true,
             args: [
@@ -30,9 +61,12 @@ export async function getPersistentContext() {
                 '--disable-background-timer-throttling',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding',
+                '--disable-ipc-flooding-protection',
                 '--no-first-run',
                 '--no-zygote',
                 '--disable-gpu',
+                '--single-process',
+                '--memory-pressure-off',
             ],
             timeout: 30000,
         });
@@ -42,6 +76,8 @@ export async function getPersistentContext() {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             locale: 'en-US',
             timezoneId: 'America/New_York',
+            // Ignore HTTPS errors to avoid cert-related delays
+            ignoreHTTPSErrors: true,
         });
 
         await _context.addInitScript(() => {
@@ -50,15 +86,13 @@ export async function getPersistentContext() {
             window.chrome = { runtime: {} };
         });
 
-        // Handle browser crash — relaunch
         _browser.on('disconnected', () => {
-            console.log('[browser] Browser disconnected, will relaunch on next request');
-            _browser = null;
-            _context = null;
-            _launching = null;
+            console.log('[browser] Disconnected — will relaunch');
+            _browser = null; _context = null; _launching = null;
+            pagePool.length = 0;
         });
 
-        console.log('[browser] Persistent browser ready');
+        console.log('[browser] Ready');
         _launching = null;
         return _context;
     })();
@@ -68,62 +102,71 @@ export async function getPersistentContext() {
 
 export async function getNewPage() {
     const context = await getPersistentContext();
-    const page = await context.newPage();
-    return page;
+    return context.newPage();
 }
 
-// Warm up: navigate to nanoreview once at startup to get CF cookies
 export async function warmUp() {
-    console.log('[browser] Warming up — passing Cloudflare...');
+    console.log('[browser] Warming up...');
+    await getPersistentContext();
     const page = await getNewPage();
     try {
         await page.route('**/*', route => {
-            if (['font', 'media', 'image', 'stylesheet'].includes(route.request().resourceType())) route.abort();
+            if (['font', 'media', 'image', 'stylesheet'].includes(route.request().resourceType()))
+                route.abort();
             else route.continue();
         });
-        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 25000 });
-        await waitForCloudflare(page, 'body', 15000).catch(() => {});
-        console.log('[browser] Warm-up complete — CF cookies cached in browser context');
+        await page.goto('https://nanoreview.net/en/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 25000,
+        });
+        await waitForCloudflare(page, 12000);
+        console.log('[browser] CF cookies cached');
     } finally {
         await page.close().catch(() => {});
     }
+    // Pre-fill page pool after warm-up
+    await fillPagePool();
+    console.log(`[browser] Page pool ready (${pagePool.length} pages)`);
 }
 
-export const waitForCloudflare = async (page, selector, timeout = 15000) => {
+/**
+ * Optimized CF check — returns immediately if page is already clear.
+ * Only polls if we're actually on a challenge page.
+ */
+export async function waitForCloudflare(page, timeout = 12000) {
+    // Quick check first — if already past CF, return immediately
+    try {
+        const title = await page.title();
+        const isChallenge = /just a moment|attention required|cloudflare|checking your browser/i.test(title);
+        if (!isChallenge) return true;
+    } catch { return true; }
+
+    // Actually on CF challenge — poll until clear
     const start = Date.now();
     while (Date.now() - start < timeout) {
         try {
-            const title = await page.title().catch(() => '');
+            const title = await page.title();
             const url = page.url();
-            const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
+            const isChallenge = /just a moment|attention required|cloudflare|checking your browser/i.test(title);
             const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
-            if (!isChallenge && !isChallengeUrl) {
-                try { await page.waitForSelector(selector, { timeout: 1000, state: 'attached' }); return true; } catch {}
-                const ok = await page.evaluate(() => document.body?.innerHTML.length > 100).catch(() => false);
-                if (ok) return true;
-            }
-            await page.waitForTimeout(500);
-        } catch { await page.waitForTimeout(500); }
+            if (!isChallenge && !isChallengeUrl) return true;
+            await page.waitForTimeout(300);
+        } catch { return true; }
     }
-    throw new Error(`CF timeout after ${timeout}ms`);
-};
+    return true; // Proceed anyway
+}
 
-export const safeNavigate = async (page, url, options = {}) => {
+export async function safeNavigate(page, url, options = {}) {
     try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000, ...options });
-        return true;
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000, ...options });
     } catch {
+        // Timeout is OK if content loaded
         const ok = await page.evaluate(() => document.body?.innerHTML.length > 100).catch(() => false);
-        if (ok) return true;
-        throw new Error(`Navigation failed: ${url}`);
+        if (!ok) throw new Error(`Navigation failed: ${url}`);
     }
-};
+}
 
-// Legacy: for Vercel compatibility
-export const getBrowserContext = async () => {
-    const context = await getPersistentContext();
-    return {
-        browser: _browser,
-        context,
-    };
-};
+export const getBrowserContext = async () => ({
+    browser: _browser || await getPersistentContext().then(() => _browser),
+    context: await getPersistentContext(),
+});

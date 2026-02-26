@@ -1,173 +1,40 @@
-# NanoReview Unofficial API
+# NanoReview API
 
-Unofficial REST API for extracting structured device data, comparisons,
-suggestions, and rankings from nanoreview.net using Playwright +
-Fastify.
+Free deployment on Render.com.
 
-------------------------------------------------------------------------
+## Deploy to Render (one-time setup)
 
-## Features
+1. Push this folder to a GitHub repo
+2. Go to [render.com](https://render.com) → New → Web Service
+3. Connect your GitHub repo
+4. Render auto-detects `render.yaml` → click **Deploy**
+5. Wait ~3 mins for build (installs Chromium)
 
--   Smart multi-type search (CPU, GPU, SoC, Phone, Laptop, Tablet)
--   Full device specifications extraction
--   Device-to-device comparison
--   Performance rankings (CPU / GPU / SoC)
--   Autocomplete suggestions
--   Cloudflare challenge handling
--   In-memory caching (5 min TTL)
--   Vercel-compatible deployment
--   MIT Licensed
+## Keep it awake for free (important!)
 
-------------------------------------------------------------------------
+Render free tier sleeps after 15 min inactivity.
+Use [UptimeRobot](https://uptimerobot.com) (free) to ping `/health` every 14 minutes:
+- Monitor type: HTTP
+- URL: `https://your-app.onrender.com/health`
+- Interval: 14 minutes
 
-## Installation
+This keeps the server awake 24/7 at zero cost.
 
-``` bash
-git clone https://github.com/yourusername/nanoreview-unofficial-api.git
-cd nanoreview-unofficial-api
-npm install
-```
+## Endpoints
 
-------------------------------------------------------------------------
+| Endpoint | Example |
+|----------|---------|
+| `GET /api/search?q=` | `/api/search?q=iPhone 16` |
+| `GET /api/search?q=&index=` | `/api/search?q=iPhone 16&index=1` |
+| `GET /api/compare?q1=&q2=` | `/api/compare?q1=iPhone 16&q2=Galaxy S24` |
+| `GET /api/suggestions?q=` | `/api/suggestions?q=pixel` |
+| `GET /api/rankings?type=` | `/api/rankings?type=mobile-soc` |
+| `GET /health` | Server status + cache stats |
 
-## Run Locally
+### Rankings types
+`desktop-cpu` · `laptop-cpu` · `mobile-soc` · `desktop-gpu` · `laptop-gpu`
 
-``` bash
-npm start
-```
-
-Server runs on:
-
-    http://localhost:3000
-
-------------------------------------------------------------------------
-
-# API Documentation
-
-Base URL:
-
-    http://localhost:3000/api
-
-------------------------------------------------------------------------
-
-## 1. Search Device
-
-### Endpoint
-
-    GET /api/search?q=<query>&index=<optional>
-
-### Example
-
-    http://localhost:3000/api/search?q=iphone 15
-
-### Response Structure
-
-``` json
-{
-  "success": true,
-  "contentType": "device_details",
-  "data": {
-    "title": "Device Name",
-    "sourceUrl": "https://nanoreview.net/...",
-    "images": [],
-    "scores": {},
-    "pros": [],
-    "cons": [],
-    "specs": {},
-    "matchedQuery": "query",
-    "searchResults": []
-  }
-}
-```
-
-------------------------------------------------------------------------
-
-## 2. Compare Devices
-
-### Endpoint
-
-    GET /api/compare?q1=<device1>&q2=<device2>
-
-### Example
-
-    http://localhost:3000/api/compare?q1=iphone 15&q2=galaxy s24
-
-### Response Structure
-
-``` json
-{
-  "success": true,
-  "contentType": "comparison",
-  "data": {
-    "title": "Device 1 vs Device 2",
-    "sourceUrl": "...",
-    "images": [],
-    "device1": {},
-    "device2": {},
-    "comparisons": {}
-  }
-}
-```
-
-------------------------------------------------------------------------
-
-## 3. Suggestions
-
-### Endpoint
-
-    GET /api/suggestions?q=<query>
-
-### Example
-
-    http://localhost:3000/api/suggestions?q=iphone
-
-------------------------------------------------------------------------
-
-## 4. Rankings
-
-### Endpoint
-
-    GET /api/rankings?type=<type>
-
-### Supported Types
-
--   desktop-cpu
--   laptop-cpu
--   mobile-soc
--   desktop-gpu
--   laptop-gpu
-
-### Example
-
-    http://localhost:3000/api/rankings?type=desktop-cpu
-
-------------------------------------------------------------------------
-
-## Error Response Format
-
-``` json
-{
-  "success": false,
-  "error": "Error message"
-}
-```
-
-Status Codes:
-
--   400 → Invalid parameters
--   404 → Not found
--   500 → Internal server error
-
-------------------------------------------------------------------------
-
-## License
-
-MIT License
-
-Copyright (c) 2026
-
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files to deal in the
-Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software.
+## Performance
+- First request after deploy/wake: ~5-8s (browser warm-up)
+- Subsequent requests: ~1-3s
+- Cached requests: <100ms

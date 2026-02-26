@@ -1,4 +1,4 @@
-import { searchDevices, scrapeDevicePage, scrapeComparePage, scrapeRankingPage, pickBestMatch } from './scraper.js';
+import { searchAndFetch, searchDevices, scrapeDevicePage, scrapeComparePage, scrapeRankingPage, pickBestMatch } from './scraper.js';
 import { cache } from './cache.js';
 
 const RANKING_URLS = {
@@ -18,19 +18,24 @@ export const setupRoutes = (fastify) => {
         if (!q) return reply.status(400).send({ success: false, error: 'Query "q" required' });
         const t0 = Date.now();
         try {
-            const results = await searchDevices(q, 10);
-            if (!results?.length) return reply.status(404).send({ success: false, error: 'No devices found' });
+            if (index !== undefined) {
+                // Index mode: search first, then fetch by index
+                const results = await searchDevices(q, 10);
+                if (!results?.length) return reply.status(404).send({ success: false, error: 'No devices found' });
+                const item = results[Math.min(parseInt(index, 10) || 0, results.length - 1)];
+                const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${getSlug(item)}`;
+                const data = await scrapeDevicePage(deviceUrl);
+                data.matchedQuery = q;
+                data.matchedDevice = item.name;
+                data.searchResults = results.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: getSlug(r) }));
+                data._ms = Date.now() - t0;
+                return reply.send({ success: true, contentType: 'device_details', data });
+            }
 
-            const item = index !== undefined
-                ? results[Math.min(parseInt(index, 10) || 0, results.length - 1)]
-                : pickBestMatch(results, q);
-
-            const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${getSlug(item)}`;
-            const data = await scrapeDevicePage(deviceUrl);
-
+            // Normal mode: optimized single call
+            const data = await searchAndFetch(q, 10);
+            if (!data) return reply.status(404).send({ success: false, error: 'No devices found' });
             data.matchedQuery = q;
-            data.matchedDevice = item.name;
-            data.searchResults = results.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: getSlug(r) }));
             data._ms = Date.now() - t0;
             return reply.send({ success: true, contentType: 'device_details', data });
         } catch (err) {
@@ -43,6 +48,7 @@ export const setupRoutes = (fastify) => {
         if (!q1 || !q2) return reply.status(400).send({ success: false, error: 'q1 and q2 required' });
         const t0 = Date.now();
         try {
+            // Search both in parallel
             const [r1, r2] = await Promise.all([searchDevices(q1, 5), searchDevices(q2, 5)]);
             if (!r1.length || !r2.length) return reply.status(404).send({ success: false, error: 'Device(s) not found' });
             const item1 = pickBestMatch(r1, q1), item2 = pickBestMatch(r2, q2);
