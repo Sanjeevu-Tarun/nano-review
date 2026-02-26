@@ -9,8 +9,3 @@ services:
         value: production
       - key: PORT
         value: 3000
-      - key: RENDER_EXTERNAL_URL
-        fromService:
-          type: web
-          name: nanoreview-api
-          property: host

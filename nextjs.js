@@ -1,14 +1,11 @@
 /**
- * nextjs.js - Exploit Next.js /_next/data/ JSON API
+ * nextjs.js - Next.js /_next/data/ JSON API
  *
- * Next.js SSR sites expose their page data as pure JSON at:
- *   /_next/data/{buildId}/{path}.json
+ * nanoreview is Next.js. Their device pages expose pure JSON at:
+ *   /_next/data/{buildId}/en/{type}/{slug}.json
  *
- * This gives us structured device data with NO browser and NO HTML parsing.
- * We discover the buildId once from the homepage HTML, then cache it.
- *
- * Example: GET /_next/data/abc123/en/phone/apple-iphone-15.json
- * Returns: { pageProps: { device: { name, specs, scores, ... } } }
+ * This returns structured device data with no HTML parsing needed.
+ * buildId is discovered once from homepage and cached in memory.
  */
 import { directFetchHtml } from './http.js';
 import { cache, TTL } from './cache.js';
@@ -16,14 +13,9 @@ import { cache, TTL } from './cache.js';
 let _buildId = null;
 let _buildIdExpiry = 0;
 
-/**
- * Extract Next.js buildId from homepage HTML.
- * The buildId is embedded in a <script id="__NEXT_DATA__"> tag.
- */
 async function fetchBuildId(cookies = '') {
     if (_buildId && Date.now() < _buildIdExpiry) return _buildId;
 
-    // Check cache
     const cached = cache.get('meta', 'buildId');
     if (cached) {
         _buildId = cached;
@@ -36,7 +28,7 @@ async function fetchBuildId(cookies = '') {
         const m = html.match(/"buildId"\s*:\s*"([^"]+)"/);
         if (m) {
             _buildId = m[1];
-            _buildIdExpiry = Date.now() + 2 * 60 * 60 * 1000; // 2h
+            _buildIdExpiry = Date.now() + 2 * 60 * 60 * 1000;
             cache.set('meta', 'buildId', _buildId, 2 * 60 * 60 * 1000);
             console.log('[nextjs] buildId:', _buildId);
             return _buildId;
@@ -47,10 +39,6 @@ async function fetchBuildId(cookies = '') {
     return null;
 }
 
-/**
- * Fetch device data via Next.js data API — pure JSON, no HTML, no browser.
- * Returns parsed pageProps or null if unavailable.
- */
 export async function fetchNextData(contentType, slug, cookies = '') {
     const buildId = await fetchBuildId(cookies);
     if (!buildId) return null;
@@ -61,14 +49,11 @@ export async function fetchNextData(contentType, slug, cookies = '') {
     if (cached) return cached;
 
     try {
-        const html = await directFetchHtml(url, cookies, 5000);
-        if (!html) return null;
-        // CF returns HTML on block — check it's actually JSON
-        if (html.trim()[0] !== '{') return null;
-        const json = JSON.parse(html);
+        const text = await directFetchHtml(url, cookies, 5000);
+        if (!text || text.trim()[0] !== '{') return null;
+        const json = JSON.parse(text);
         const props = json?.pageProps;
         if (!props) return null;
-
         const d = props?.device || props?.phone || props?.item || props?.data || props?.pageData;
         if (!d?.name) return null;
 
@@ -84,19 +69,13 @@ export async function fetchNextData(contentType, slug, cookies = '') {
         };
 
         cache.set('device', cacheKey, result, TTL.device);
-        console.log('[nextjs] API hit:', url);
+        console.log('[nextjs] hit:', slug);
         return result;
-    } catch (err) {
-        console.log('[nextjs] API miss:', err.message);
+    } catch {
         return null;
     }
 }
 
-/**
- * Prefetch and cache buildId at startup so it's ready before first request.
- */
 export async function prefetchBuildId(cookies = '') {
-    try {
-        await fetchBuildId(cookies);
-    } catch {}
+    await fetchBuildId(cookies).catch(() => {});
 }

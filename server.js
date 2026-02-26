@@ -13,35 +13,29 @@ const port = parseInt(process.env.PORT || '3000', 10);
 await fastify.listen({ port, host: '0.0.0.0' });
 console.log(`\n🚀 Server live on port ${port}`);
 
-// Warm up immediately — browser + CF cookies + Next.js buildId all in parallel
+// Start warmup immediately in background — don't block server startup.
+// First request will wait on warmUpPromise if warmup isn't done yet.
 warmUp()
     .then(async () => {
         const cookies = await getCFCookies() || '';
         await prefetchBuildId(cookies);
-        console.log('[startup] Fully ready');
+        console.log('[startup] Fully ready ✅');
     })
     .catch(err => console.warn('[startup] Warm-up error:', err.message));
 
-// ── Keep-alive: prevent Render free tier from sleeping ──────────────────────
-// Render sleeps after 15 min inactivity → cold start → 13s per request
-// Self-ping every 10 min keeps the process warm
-const SELF = process.env.RENDER_EXTERNAL_URL
-    ? `https://${process.env.RENDER_EXTERNAL_URL}`
-    : (process.env.SELF_URL || `http://localhost:${port}`);
-
-setInterval(async () => {
-    try {
-        await fetch(`${SELF}/health`, { signal: AbortSignal.timeout(5000) });
-        console.log('[keepalive] ok');
-    } catch {}
-}, 10 * 60 * 1000).unref();
-
 // ── CF cookie refresh every 20 min ──────────────────────────────────────────
+// Keeps the CF session alive so direct HTTP keeps working between requests.
 setInterval(async () => {
     const cookies = await getCFCookies();
     if (!cookies) return;
     try {
         await browserFetchDirect('https://nanoreview.net/en/');
-        console.log('[keepalive] CF refreshed');
+        console.log('[keepalive] CF cookies refreshed');
     } catch {}
 }, 20 * 60 * 1000).unref();
+
+// NOTE: To prevent Render free tier sleep (the main cause of 13s cold starts),
+// set up UptimeRobot: https://uptimerobot.com
+// → Add monitor → HTTP(s) → your-app.onrender.com/health → every 5 minutes
+// This is FREE and keeps your service warm. Without it, every request after
+// 15min idle will be a cold start regardless of any code optimizations.
