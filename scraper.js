@@ -1,19 +1,6 @@
-/**
- * scraper.js
- *
- * SPEED OPTIMIZATIONS:
- * 1. Search via direct HTTP JSON (no browser, ~200ms)
- * 2. Search + device fetch run in PARALLEL when possible
- * 3. Uses pooled pages (pre-opened, no newPage() overhead)
- * 4. waitForTimeout reduced to minimum (100ms settle)
- * 5. __NEXT_DATA__ extraction — if nanoreview is Next.js, get all data
- *    from the embedded JSON without waiting for JS to render anything
- * 6. Cache checked before any browser work
- */
 import * as cheerio from 'cheerio';
 import { getPooledPage, waitForCloudflare, safeNavigate } from './browser.js';
 import { cache, TTL } from './cache.js';
-import { directSearch } from './http.js';
 
 const detectLikelyTypes = (query) => {
     const q = query.toLowerCase();
@@ -45,33 +32,192 @@ function scoreMatch(name, slug, q) {
 export function pickBestMatch(results, query) {
     const q = query.toLowerCase().trim();
     const qSlug = q.replace(/\s+/g, '-');
-    const slug = r => r.slug || r.url_name || '';
     return (
-        results.find(r => slug(r) === q) ||
-        results.find(r => slug(r) === qSlug) ||
+        results.find(r => r.slug === q) ||
+        results.find(r => r.slug === qSlug) ||
         results.find(r => r.name?.toLowerCase() === q) ||
-        results.find(r => slug(r).includes(qSlug)) ||
+        results.find(r => r.slug?.includes(qSlug)) ||
         results.find(r => r.name?.toLowerCase().includes(q)) ||
         results.find(r => q.split(/\s+/).every(w => r.name?.toLowerCase().includes(w))) ||
         results[0]
     );
 }
 
-// ── HTML Parser ────────────────────────────────────────────────────────────
+/**
+ * THE KEY FIX:
+ * Nanoreview's JSON search API sometimes returns items with no slug field.
+ * Instead of guessing the slug from the name, we do ONE browser navigation
+ * to nanoreview.net/en/ and then:
+ * 1. Call search JSON API via fetch() — gets name + type (+ slug if available)
+ * 2. Intercept the actual page navigation to get the REAL URL with slug
+ * 3. Navigate directly to the device page in the same tab
+ * 4. Extract HTML — all in ONE page, ONE CF pass
+ */
+export const searchAndFetch = async (query, limit = 10) => {
+    const cacheKey = `full:${query.toLowerCase()}`;
+    const cached = cache.get('device', cacheKey);
+    if (cached) return cached;
+
+    const types = detectLikelyTypes(query);
+    const page = await getPooledPage();
+
+    try {
+        // Navigate to nanoreview — pass CF once
+        await safeNavigate(page, 'https://nanoreview.net/en/');
+        await waitForCloudflare(page, 10000);
+
+        // Step 1: Search API — get all results including real slugs
+        // We intercept ALL fetch/XHR responses to capture search API responses
+        const searchResults = await page.evaluate(async ({ query, limit, types }) => {
+            const results = [];
+
+            await Promise.all(types.map(async (type) => {
+                try {
+                    const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
+                    const r = await fetch(url, { headers: { Accept: 'application/json' } });
+                    if (!r.ok) return;
+                    const data = await r.json();
+                    if (Array.isArray(data)) {
+                        data.forEach(item => {
+                            results.push({ ...item, content_type: item.content_type || type });
+                        });
+                    }
+                } catch {}
+            }));
+
+            return results;
+        }, { query, limit, types });
+
+        console.log('[search] results count:', searchResults.length);
+        if (searchResults.length > 0) {
+            console.log('[search] first item keys:', Object.keys(searchResults[0]));
+            console.log('[search] first item:', JSON.stringify(searchResults[0]));
+        }
+
+        if (!searchResults.length) return null;
+
+        // Dedupe and sort
+        const seen = new Set();
+        const deduped = searchResults.filter(r => {
+            // Use any available identifier to dedupe
+            const key = r.slug || r.url_name || r.url || r.id || r.name;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+        deduped.sort((a, b) => {
+            const sA = a.slug || a.url_name || a.url || '';
+            const sB = b.slug || b.url_name || b.url || '';
+            return scoreMatch(b.name, sB, query) - scoreMatch(a.name, sA, query);
+        });
+
+        const item = pickBestMatch(deduped, query);
+        console.log('[search] picked item:', JSON.stringify(item));
+
+        // Step 2: Get the real device URL
+        // Priority: use slug/url_name if present, else navigate to search results page
+        // and extract the real href from the HTML
+        let deviceUrl = null;
+
+        if (item.slug) {
+            deviceUrl = `https://nanoreview.net/en/${item.content_type}/${item.slug}`;
+        } else if (item.url_name) {
+            deviceUrl = `https://nanoreview.net/en/${item.content_type}/${item.url_name}`;
+        } else if (item.url && item.url.startsWith('http')) {
+            deviceUrl = item.url;
+        } else if (item.url) {
+            deviceUrl = `https://nanoreview.net${item.url}`;
+        } else {
+            // No slug at all — navigate to search results page and extract real href
+            console.log('[search] No slug found, scraping search page for real URL...');
+
+            const searchPageUrl = `https://nanoreview.net/en/search?q=${encodeURIComponent(query)}`;
+            await safeNavigate(page, searchPageUrl);
+            await page.waitForTimeout(500);
+
+            const foundUrl = await page.evaluate((itemName) => {
+                // Look for a link whose text matches the device name
+                const links = [...document.querySelectorAll('a[href]')];
+                for (const link of links) {
+                    const text = link.textContent?.trim() || '';
+                    const href = link.getAttribute('href') || '';
+                    // Match by name similarity
+                    if (text.toLowerCase().includes(itemName.toLowerCase().split(' ').slice(-1)[0].toLowerCase())
+                        && (href.includes('/phone/') || href.includes('/tablet/') || href.includes('/laptop/')
+                            || href.includes('/cpu/') || href.includes('/gpu/') || href.includes('/soc/'))) {
+                        return href.startsWith('http') ? href : `https://nanoreview.net${href}`;
+                    }
+                }
+
+                // Fallback: grab first device link on page
+                for (const link of links) {
+                    const href = link.getAttribute('href') || '';
+                    if (/\/(phone|tablet|laptop|cpu|gpu|soc)\/[a-z0-9-]+/.test(href)) {
+                        return href.startsWith('http') ? href : `https://nanoreview.net${href}`;
+                    }
+                }
+                return null;
+            }, item.name);
+
+            if (foundUrl) {
+                deviceUrl = foundUrl;
+                console.log('[search] Found real URL from search page:', deviceUrl);
+            } else {
+                // Last resort: generate slug from name
+                const generatedSlug = item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+                deviceUrl = `https://nanoreview.net/en/${item.content_type}/${generatedSlug}`;
+                console.log('[search] Generated slug URL:', deviceUrl);
+            }
+        }
+
+        console.log('[search] device URL:', deviceUrl);
+
+        // Check cache
+        const deviceCached = cache.get('device', deviceUrl);
+        if (deviceCached) {
+            deviceCached.searchResults = deduped.map((r, i) => ({
+                index: i, name: r.name, type: r.content_type,
+                slug: r.slug || r.url_name || r.url || null,
+            }));
+            deviceCached.matchedDevice = item.name;
+            return deviceCached;
+        }
+
+        // Step 3: Navigate to device page in SAME tab (already past CF, instant load)
+        await safeNavigate(page, deviceUrl);
+        await page.waitForTimeout(300);
+
+        const html = await page.content();
+        const data = parseDeviceHtml(html, deviceUrl);
+
+        data.searchResults = deduped.map((r, i) => ({
+            index: i, name: r.name, type: r.content_type,
+            slug: r.slug || r.url_name || r.url || null,
+        }));
+        data.matchedDevice = item.name;
+
+        cache.set('device', deviceUrl, data, TTL.device);
+        cache.set('device', cacheKey, data, TTL.device);
+        return data;
+
+    } finally {
+        await page.close().catch(() => {});
+    }
+};
 
 function parseDeviceHtml(html, url) {
     const $ = cheerio.load(html);
 
-    // Try __NEXT_DATA__ first — instant, no selector matching needed
-    const nextDataEl = $('#__NEXT_DATA__').html();
-    if (nextDataEl) {
-        try {
-            const nextData = JSON.parse(nextDataEl);
-            const props = nextData?.props?.pageProps;
-            if (props && (props.device || props.phone || props.item || props.data)) {
-                const d = props.device || props.phone || props.item || props.data;
+    // Try __NEXT_DATA__ (Next.js sites embed full data as JSON — no selector needed)
+    try {
+        const raw = $('#__NEXT_DATA__').html();
+        if (raw) {
+            const next = JSON.parse(raw);
+            const props = next?.props?.pageProps;
+            const d = props?.device || props?.phone || props?.item || props?.data || props?.pageData;
+            if (d?.name) {
                 return {
-                    title: d.name || d.title || $('h1').first().text().trim(),
+                    title: d.name,
                     sourceUrl: url,
                     images: d.image ? [d.image] : (d.images || []),
                     scores: d.scores || d.ratings || {},
@@ -81,14 +227,11 @@ function parseDeviceHtml(html, url) {
                     _source: 'next_data',
                 };
             }
-        } catch {}
-    }
+        }
+    } catch {}
 
-    // Standard HTML parsing
-    const data = {
-        title: $('h1').first().text().trim(),
-        sourceUrl: url, images: [], scores: {}, pros: [], cons: [], specs: {},
-    };
+    const title = $('h1').first().text().trim();
+    const data = { title, sourceUrl: url, images: [], scores: {}, pros: [], cons: [], specs: {} };
 
     const seen = new Set();
     $('img').each((_, img) => {
@@ -102,14 +245,14 @@ function parseDeviceHtml(html, url) {
         });
     });
     $('[class*="score"],.progress-bar,.rating-box').each((_, el) => {
-        const label = $(el).find('[class*="title"],[class*="name"]').first().text().trim() || $(el).prev('div,p,span').text().trim();
+        const label = $(el).find('[class*="title"],[class*="name"]').first().text().trim() || $(el).prev().text().trim();
         const value = $(el).find('[class*="value"],[class*="num"]').first().text().trim() || $(el).text().replace(/[^0-9]/g, '').trim();
         if (label && value && label !== value) data.scores[label] = value;
     });
     $('[class*="pros"] li,[class*="plus"] li,.green li').each((_, el) => { const t = $(el).text().trim(); if (t) data.pros.push(t); });
     $('[class*="cons"] li,[class*="minus"] li,.red li').each((_, el) => { const t = $(el).text().trim(); if (t) data.cons.push(t); });
     $('.card,.box,section,[class*="specs"]').each((_, card) => {
-        const title = $(card).find('.card-header,.card-title,h2,h3').first().text().trim() || 'Details';
+        const sTitle = $(card).find('.card-header,.card-title,h2,h3').first().text().trim() || 'Details';
         const section = {};
         $(card).find('table tr').each((__, row) => {
             const cells = $(row).find('td,th');
@@ -119,26 +262,23 @@ function parseDeviceHtml(html, url) {
                 if (label && value && label !== value) section[label] = value;
             }
         });
-        if (Object.keys(section).length > 0) data.specs[title] = section;
+        if (Object.keys(section).length > 0) data.specs[sTitle] = section;
     });
     return data;
 }
 
-// ── Core browser fetch — uses pooled page ─────────────────────────────────
+// ── Other scrapers (compare, ranking) ─────────────────────────────────────
 
 async function browserFetchHtml(url) {
     const page = await getPooledPage();
     try {
         await safeNavigate(page, url);
-        // Minimal settle — context already past CF so page loads instantly
-        await page.waitForTimeout(100);
+        await page.waitForTimeout(200);
         return await page.content();
     } finally {
         await page.close().catch(() => {});
     }
 }
-
-// ── Search ─────────────────────────────────────────────────────────────────
 
 export const searchDevices = async (query, limit = 10) => {
     const cacheKey = `search:${query.toLowerCase()}-${limit}`;
@@ -146,25 +286,11 @@ export const searchDevices = async (query, limit = 10) => {
     if (cached) return cached;
 
     const types = detectLikelyTypes(query);
-
-    // Fast path: direct HTTP JSON — no browser needed, ~200ms
-    let results;
-    try { results = await directSearch(query, limit, types); } catch { results = null; }
-
-    if (results?.length) {
-        const seen = new Set();
-        results = results.filter(r => { const s = r.slug || ''; if (seen.has(s)) return false; seen.add(s); return true; });
-        results.sort((a, b) => scoreMatch(b.name, b.slug, query) - scoreMatch(a.name, a.slug, query));
-        cache.set('search', cacheKey, results, TTL.search);
-        return results;
-    }
-
-    // Browser fallback — use pooled page (pre-opened, fast)
     const page = await getPooledPage();
     try {
         await safeNavigate(page, 'https://nanoreview.net/en/');
         await waitForCloudflare(page, 10000);
-        results = await page.evaluate(async ({ query, limit, types }) => {
+        const results = await page.evaluate(async ({ query, limit, types }) => {
             const all = await Promise.all(types.map(async type => {
                 try {
                     const r = await fetch(`https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`, { headers: { Accept: 'application/json' } });
@@ -175,96 +301,12 @@ export const searchDevices = async (query, limit = 10) => {
             }));
             return all.flat();
         }, { query, limit, types });
-    } finally {
-        await page.close().catch(() => {});
-    }
-
-    if (!results?.length) return [];
-    const seen = new Set();
-    results = results.filter(r => { const s = r.slug || ''; if (seen.has(s)) return false; seen.add(s); return true; });
-    results.sort((a, b) => scoreMatch(b.name, b.slug, query) - scoreMatch(a.name, a.slug, query));
-    cache.set('search', cacheKey, results, TTL.search);
-    return results;
-};
-
-// ── Main search+device — runs search & device fetch in PARALLEL ────────────
-
-export const searchAndFetch = async (query, limit = 10) => {
-    const cacheKey = `full:${query.toLowerCase()}`;
-    const cached = cache.get('device', cacheKey);
-    if (cached) return cached;
-
-    const types = detectLikelyTypes(query);
-
-    // Step 1: Search via direct HTTP (fast, no browser)
-    let searchResults;
-    try { searchResults = await directSearch(query, limit, types); } catch { searchResults = []; }
-
-    if (searchResults?.length) {
-        // Dedupe + sort
         const seen = new Set();
-        searchResults = searchResults.filter(r => { const s = r.slug || ''; if (seen.has(s)) return false; seen.add(s); return true; });
-        searchResults.sort((a, b) => scoreMatch(b.name, b.slug, query) - scoreMatch(a.name, a.slug, query));
-
-        // Cache search results
-        cache.set('search', `search:${query.toLowerCase()}-${limit}`, searchResults, TTL.search);
-
-        const item = pickBestMatch(searchResults, query);
-        const slug = item.slug || item.url_name || item.name?.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-        const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${slug}`;
-
-        // Check device cache
-        const deviceCached = cache.get('device', deviceUrl);
-        if (deviceCached) {
-            deviceCached.searchResults = searchResults.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: r.slug || r.url_name }));
-            deviceCached.matchedDevice = item.name;
-            return deviceCached;
-        }
-
-        // Fetch device page with browser (context already warm)
-        const html = await browserFetchHtml(deviceUrl);
-        const data = parseDeviceHtml(html, deviceUrl);
-        data.searchResults = searchResults.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: r.slug || r.url_name }));
-        data.matchedDevice = item.name;
-        cache.set('device', deviceUrl, data, TTL.device);
-        cache.set('device', cacheKey, data, TTL.device);
-        return data;
-    }
-
-    // Browser fallback for search
-    const page = await getPooledPage();
-    let results;
-    try {
-        await safeNavigate(page, 'https://nanoreview.net/en/');
-        await waitForCloudflare(page, 10000);
-        results = await page.evaluate(async ({ query, limit, types }) => {
-            const all = await Promise.all(types.map(async type => {
-                try {
-                    const r = await fetch(`https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`, { headers: { Accept: 'application/json' } });
-                    if (!r.ok) return [];
-                    const d = await r.json();
-                    return Array.isArray(d) ? d.map(x => ({ ...x, content_type: x.content_type || type })) : [];
-                } catch { return []; }
-            }));
-            return all.flat();
-        }, { query, limit, types });
+        const deduped = results.filter(r => { const k = r.slug || r.name; if (seen.has(k)) return false; seen.add(k); return true; });
+        deduped.sort((a, b) => scoreMatch(b.name, b.slug || '', query) - scoreMatch(a.name, a.slug || '', query));
+        cache.set('search', cacheKey, deduped, TTL.search);
+        return deduped;
     } finally { await page.close().catch(() => {}); }
-
-    if (!results?.length) return null;
-    const seen = new Set();
-    results = results.filter(r => { const s = r.slug || ''; if (seen.has(s)) return false; seen.add(s); return true; });
-    results.sort((a, b) => scoreMatch(b.name, b.slug, query) - scoreMatch(a.name, a.slug, query));
-
-    const item = pickBestMatch(results, query);
-    const slug = item.slug || item.url_name || '';
-    const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${slug}`;
-    const html = await browserFetchHtml(deviceUrl);
-    const data = parseDeviceHtml(html, deviceUrl);
-    data.searchResults = results.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: r.slug || r.url_name }));
-    data.matchedDevice = item.name;
-    cache.set('device', deviceUrl, data, TTL.device);
-    cache.set('device', cacheKey, data, TTL.device);
-    return data;
 };
 
 export const scrapeDevicePage = async (deviceUrl) => {
@@ -282,26 +324,24 @@ export const scrapeComparePage = async (compareUrl) => {
     const html = await browserFetchHtml(compareUrl);
     const $ = cheerio.load(html);
     const data = {
-        title: $('h1').first().text().trim(), sourceUrl: compareUrl, images: [],
-        device1: { name: '', score: '' }, device2: { name: '', score: '' }, comparisons: {},
+        title: $('h1').first().text().trim(), sourceUrl: compareUrl,
+        device1: { name: '' }, device2: { name: '' }, comparisons: {},
     };
     const headers = [];
-    $('.compare-header [class*="title"],.vs-header h2,th').each((_, el) => {
-        const t = $(el).text().trim(); if (t && t.toLowerCase() !== 'vs') headers.push(t);
-    });
+    $('th,[class*="title"]').each((_, el) => { const t = $(el).text().trim(); if (t && t.toLowerCase() !== 'vs') headers.push(t); });
     if (headers.length >= 2) { data.device1.name = headers[0]; data.device2.name = headers[1]; }
     $('.card,.box,section,[class*="specs"]').each((_, card) => {
-        const title = $(card).find('.card-header,.card-title,h2,h3').first().text().trim() || 'Comparison';
+        const sTitle = $(card).find('h2,h3').first().text().trim() || 'Comparison';
         const section = {};
         $(card).find('table tr').each((__, row) => {
             const cells = $(row).find('td,th');
             if (cells.length >= 3) {
-                const feature = cells.eq(0).text().trim().replace(/:$/, '');
-                const val1 = cells.eq(1).text().trim(), val2 = cells.eq(2).text().trim();
-                if (feature) section[feature] = { [data.device1.name || 'Device 1']: val1, [data.device2.name || 'Device 2']: val2 };
+                const f = cells.eq(0).text().trim().replace(/:$/, '');
+                const v1 = cells.eq(1).text().trim(), v2 = cells.eq(2).text().trim();
+                if (f) section[f] = { [data.device1.name || 'Device 1']: v1, [data.device2.name || 'Device 2']: v2 };
             }
         });
-        if (Object.keys(section).length > 0) data.comparisons[title] = section;
+        if (Object.keys(section).length > 0) data.comparisons[sTitle] = section;
     });
     cache.set('compare', compareUrl, data, TTL.compare);
     return data;
@@ -336,9 +376,7 @@ export const scrapeRankingHtml = (html, url) => {
     $('table thead th').each((_, th) => headers.push($(th).text().trim()));
     $('table tbody tr').each((_, row) => {
         const item = {};
-        $(row).find('td').each((i, td) => {
-            item[headers[i]?.toLowerCase().replace(/\s+/g, '_') || `col_${i}`] = $(td).text().trim();
-        });
+        $(row).find('td').each((i, td) => { item[headers[i]?.toLowerCase().replace(/\s+/g, '_') || `col_${i}`] = $(td).text().trim(); });
         if (Object.keys(item).length > 0) data.rankings.push(item);
     });
     return data;
