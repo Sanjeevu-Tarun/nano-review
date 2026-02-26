@@ -1,140 +1,129 @@
-import chromium from '@sparticuz/chromium';
-import { chromium as playwrightCore } from 'playwright-core';
+/**
+ * browser.js
+ * Persistent browser singleton — launched ONCE, reused forever.
+ * This only works on persistent servers (Railway, Render, VPS).
+ * On Vercel (serverless) each request is a new process so this has no benefit.
+ */
 import { chromium as playwrightLocal } from 'playwright';
 
-export const getBrowserContext = async () => {
-    const isVercel = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
-    let browser;
+let _browser = null;
+let _context = null;
+let _launching = null;
 
-    if (isVercel) {
-        // Vercel environment - use playwright-core with chromium
-        const executablePath = await chromium.executablePath();
-        browser = await playwrightCore.launch({
-            args: [
-                ...chromium.args,
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-dev-shm-usage',
-                '--no-first-run',
-                '--no-zygote',
-                '--single-process',
-            ],
-            executablePath: executablePath || undefined,
-            headless: chromium.headless !== false ? true : chromium.headless,
-            timeout: 30000,
-        });
-    } else {
-        // Local environment
-        browser = await playwrightLocal.launch({
+export async function getPersistentContext() {
+    // If already ready, return immediately
+    if (_context && _browser.isConnected()) return _context;
+
+    // If launching in progress, wait for it
+    if (_launching) return _launching;
+
+    _launching = (async () => {
+        console.log('[browser] Launching persistent browser...');
+        _browser = await playwrightLocal.launch({
             headless: true,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
+                '--disable-extensions',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
             ],
             timeout: 30000,
         });
+
+        _context = await _browser.newContext({
+            viewport: { width: 1280, height: 720 },
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            locale: 'en-US',
+            timezoneId: 'America/New_York',
+        });
+
+        await _context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            window.chrome = { runtime: {} };
+        });
+
+        // Handle browser crash — relaunch
+        _browser.on('disconnected', () => {
+            console.log('[browser] Browser disconnected, will relaunch on next request');
+            _browser = null;
+            _context = null;
+            _launching = null;
+        });
+
+        console.log('[browser] Persistent browser ready');
+        _launching = null;
+        return _context;
+    })();
+
+    return _launching;
+}
+
+export async function getNewPage() {
+    const context = await getPersistentContext();
+    const page = await context.newPage();
+    return page;
+}
+
+// Warm up: navigate to nanoreview once at startup to get CF cookies
+export async function warmUp() {
+    console.log('[browser] Warming up — passing Cloudflare...');
+    const page = await getNewPage();
+    try {
+        await page.route('**/*', route => {
+            if (['font', 'media', 'image', 'stylesheet'].includes(route.request().resourceType())) route.abort();
+            else route.continue();
+        });
+        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await waitForCloudflare(page, 'body', 15000).catch(() => {});
+        console.log('[browser] Warm-up complete — CF cookies cached in browser context');
+    } finally {
+        await page.close().catch(() => {});
     }
+}
 
-    const context = await browser.newContext({
-        viewport: { width: 1280, height: 720 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        locale: 'en-US',
-        timezoneId: 'America/New_York',
-        extraHTTPHeaders: {
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        },
-        // Increase timeout for slow responses
-        timeout: 30000,
-    });
-
-    // Add stealth-like behavior without the plugin
-    await context.addInitScript(() => {
-        // Override the navigator.webdriver property
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined,
-        });
-
-        // Override the navigator.plugins to appear more real
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5],
-        });
-
-        // Override chrome property
-        window.chrome = {
-            runtime: {},
-        };
-
-        // Override permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-    });
-
-    return { browser, context };
-};
-
-export const waitForCloudflare = async (page, selector, timeout = 20000) => {
+export const waitForCloudflare = async (page, selector, timeout = 15000) => {
     const start = Date.now();
-    let lastError;
-
     while (Date.now() - start < timeout) {
         try {
-            // Check if we're past Cloudflare
             const title = await page.title().catch(() => '');
-            const url = await page.url().catch(() => '');
-
+            const url = page.url();
             const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
             const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
-
             if (!isChallenge && !isChallengeUrl) {
-                // Try to find the selector or just return if page seems loaded
-                try {
-                    await page.waitForSelector(selector, { timeout: 2000, state: 'attached' });
-                    return true;
-                } catch {
-                    // Check if page at least has content
-                    const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
-                    if (hasContent) return true;
-                }
+                try { await page.waitForSelector(selector, { timeout: 1000, state: 'attached' }); return true; } catch {}
+                const ok = await page.evaluate(() => document.body?.innerHTML.length > 100).catch(() => false);
+                if (ok) return true;
             }
-
-            await page.waitForTimeout(1000);
-        } catch (error) {
-            lastError = error;
-            await page.waitForTimeout(1000);
-        }
+            await page.waitForTimeout(500);
+        } catch { await page.waitForTimeout(500); }
     }
-
-    // One final check before failing
-    try {
-        const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
-        if (hasContent) return true;
-    } catch {}
-
-    throw new Error(`Cloudflare timeout after ${timeout}ms: ${lastError?.message || 'Unknown error'}`);
+    throw new Error(`CF timeout after ${timeout}ms`);
 };
 
 export const safeNavigate = async (page, url, options = {}) => {
-    const defaultOptions = {
-        waitUntil: 'domcontentloaded',
-        timeout: 25000,
-    };
-
     try {
-        await page.goto(url, { ...defaultOptions, ...options });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000, ...options });
         return true;
-    } catch (error) {
-        // If navigation times out but we have content, that's okay
-        try {
-            const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
-            if (hasContent) return true;
-        } catch {}
-        throw error;
+    } catch {
+        const ok = await page.evaluate(() => document.body?.innerHTML.length > 100).catch(() => false);
+        if (ok) return true;
+        throw new Error(`Navigation failed: ${url}`);
     }
+};
+
+// Legacy: for Vercel compatibility
+export const getBrowserContext = async () => {
+    const context = await getPersistentContext();
+    return {
+        browser: _browser,
+        context,
+    };
 };
