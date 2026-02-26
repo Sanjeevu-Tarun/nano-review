@@ -1,21 +1,10 @@
 /**
- * http.js - HTTP client with TLS fingerprint spoofing
- *
- * Priority:
- * 1. tls-client / got-scraping (Chrome TLS fingerprint) → bypasses CF natively
- * 2. Direct Node https (only works with valid CF cookies)
- *
- * The key insight: CF blocks Node.js by JA3/JA4 TLS hash, not by cookies alone.
- * With a Chrome TLS fingerprint, CF cookies aren't even needed.
+ * http.js - Direct HTTP client with gzip decompression + CF cookie support
  */
 import https from 'https';
 import http from 'http';
 import zlib from 'zlib';
-import { tlsFetch, tlsSearch, tlsFetchHtml, hasTlsClient } from './tlsclient.js';
 
-export { tlsSearch, tlsFetchHtml };
-
-// Persistent connection pool for Node fallback
 const agent = new https.Agent({
     keepAlive: true,
     maxSockets: 30,
@@ -30,7 +19,10 @@ function buildHeaders(cookies = '', isJson = false) {
         'Accept-Encoding': 'gzip, deflate, br',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Referer': 'https://nanoreview.net/',
-        'sec-ch-ua': '"Google Chrome";v="131"',
+        'Origin': 'https://nanoreview.net',
+        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
         'sec-fetch-dest': isJson ? 'empty' : 'document',
         'sec-fetch-mode': isJson ? 'cors' : 'navigate',
         'sec-fetch-site': 'same-origin',
@@ -88,19 +80,7 @@ function nodeRequest(url, headers, timeoutMs = 6000, hops = 0) {
     });
 }
 
-/**
- * Search API - tries TLS spoof first, falls back to Node with cookies
- */
 export async function directSearch(query, limit = 5, types = ['phone','laptop','cpu','gpu','soc','tablet'], cookies = '') {
-    // Try TLS spoof first (no cookies needed)
-    if (hasTlsClient()) {
-        try {
-            const results = await tlsSearch(query, limit, types);
-            if (results.length > 0) return results;
-        } catch {}
-    }
-
-    // Fallback: Node.js with CF cookies
     const headers = buildHeaders(cookies, true);
     const results = await Promise.all(types.map(async type => {
         const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
@@ -114,20 +94,7 @@ export async function directSearch(query, limit = 5, types = ['phone','laptop','
     return results.flat();
 }
 
-/**
- * Fetch HTML - tries TLS spoof first, falls back to Node with cookies
- */
 export async function directFetchHtml(url, cookies = '', timeoutMs = 7000) {
-    // Try TLS spoof (no cookies needed)
-    if (hasTlsClient()) {
-        try {
-            return await tlsFetchHtml(url, timeoutMs);
-        } catch (e) {
-            console.log('[http] TLS spoof failed:', e.message);
-        }
-    }
-
-    // Fallback: Node with CF cookies
     const { status, text } = await nodeRequest(url, buildHeaders(cookies, false), timeoutMs);
     if (status >= 400) throw new Error(`HTTP ${status}`);
     if (/just a moment|checking your browser/i.test(text)) throw new Error('CF challenge');
