@@ -1,17 +1,10 @@
 /**
  * routes.js
- * 
- * EXACT v1 pattern that works:
- * - One browser per request
- * - SAME context passed to searchDevices AND scrapeDevicePage
- *   so CF cookies carry over — device page loads instantly
- * 
- * FIXES vs v1:
- * - Better slug matching (match by slug, not just name)
- * - Cache check BEFORE launching browser (skip browser entirely on cache hit)
- * - Search result limit increased to get better matches
+ * /api/search uses getDeviceData() — ONE browser open, ONE page,
+ * fetches search + device details all via fetch() inside that page.
+ * Much faster because no second page load / CF challenge.
  */
-import { searchDevices, scrapeDevicePage, scrapeComparePage, scrapeRankingPage } from './scraper.js';
+import { getDeviceData, searchDevices, scrapeDevicePage, scrapeComparePage, scrapeRankingPage } from './scraper.js';
 import { getBrowserContext } from './browser.js';
 import { cache } from './cache.js';
 
@@ -27,76 +20,60 @@ function getSlug(item) {
     return item.slug || item.url_name || item.name?.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 }
 
-/**
- * Pick best matching item from results given query.
- * Tries: exact slug match → exact name match → slug contains query → name contains query → first result
- */
 function pickBestMatch(results, query) {
     const q = query.toLowerCase().trim();
-    // 1. Exact slug match
-    const bySlug = results.find(r => getSlug(r) === q);
-    if (bySlug) return bySlug;
-    // 2. Exact name match
-    const byName = results.find(r => r.name.toLowerCase() === q);
-    if (byName) return byName;
-    // 3. Slug contains query (e.g. query="poco x6", slug="xiaomi-poco-x6")
     const qSlug = q.replace(/\s+/g, '-');
-    const bySlugContains = results.find(r => getSlug(r).includes(qSlug));
-    if (bySlugContains) return bySlugContains;
-    // 4. Name contains full query
-    const byNameContains = results.find(r => r.name.toLowerCase().includes(q));
-    if (byNameContains) return byNameContains;
-    // 5. All query words present in name
-    const words = q.split(/\s+/);
-    const byWords = results.find(r => words.every(w => r.name.toLowerCase().includes(w)));
-    if (byWords) return byWords;
-    // fallback: first result
-    return results[0];
+    return (
+        results.find(r => getSlug(r) === q) ||
+        results.find(r => getSlug(r) === qSlug) ||
+        results.find(r => r.name?.toLowerCase() === q) ||
+        results.find(r => getSlug(r)?.includes(qSlug)) ||
+        results.find(r => r.name?.toLowerCase().includes(q)) ||
+        results.find(r => q.split(/\s+/).every(w => r.name?.toLowerCase().includes(w))) ||
+        results[0]
+    );
 }
 
 export const setupRoutes = (fastify) => {
 
+    // Main search endpoint — uses single-page strategy
     fastify.get('/api/search', async (req, reply) => {
         const { q, index } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
 
         const t0 = Date.now();
-        let browser;
         try {
-            const b = await getBrowserContext();
-            browser = b.browser;
-            const context = b.context;
-
-            // Get more results for better matching
-            const results = await searchDevices(context, q, 10);
-            if (!results?.length)
-                return reply.status(404).send({ success: false, error: 'No devices found' });
-
-            let item;
+            // If index is specified, we need to search first then pick by index
             if (index !== undefined) {
-                item = results[Math.min(parseInt(index, 10) || 0, results.length - 1)];
-            } else {
-                item = pickBestMatch(results, q);
+                let browser;
+                try {
+                    const b = await getBrowserContext();
+                    browser = b.browser;
+                    const results = await searchDevices(b.context, q, 10);
+                    if (!results?.length) return reply.status(404).send({ success: false, error: 'No devices found' });
+
+                    const item = results[Math.min(parseInt(index, 10) || 0, results.length - 1)];
+                    const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${getSlug(item)}`;
+                    const data = await scrapeDevicePage(b.context, deviceUrl);
+                    data.matchedQuery = q;
+                    data.matchedDevice = item.name;
+                    data.searchResults = results.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: getSlug(r) }));
+                    data._ms = Date.now() - t0;
+                    return reply.send({ success: true, contentType: 'device_details', data });
+                } finally {
+                    if (browser) await browser.close().catch(() => {});
+                }
             }
 
-            const slug = getSlug(item);
-            const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${slug}`;
-
-            // SAME context — already past CF, loads instantly
-            const data = await scrapeDevicePage(context, deviceUrl);
+            // Normal flow: one-page fetch (search + details together)
+            const data = await getDeviceData(q, 10);
+            if (!data) return reply.status(404).send({ success: false, error: 'No devices found' });
 
             data.matchedQuery = q;
-            data.matchedDevice = item.name;
-            data.searchResults = results.map((r, i) => ({
-                index: i, name: r.name, type: r.content_type, slug: getSlug(r),
-            }));
             data._ms = Date.now() - t0;
-
             return reply.send({ success: true, contentType: 'device_details', data });
         } catch (err) {
             return reply.status(500).send({ success: false, error: err.message });
-        } finally {
-            if (browser) await browser.close().catch(() => {});
         }
     });
 
@@ -139,9 +116,7 @@ export const setupRoutes = (fastify) => {
         try {
             const b = await getBrowserContext();
             browser = b.browser;
-            const context = b.context;
-
-            const results = await searchDevices(context, q, 10);
+            const results = await searchDevices(b.context, q, 10);
             const data = results.map((r, i) => ({
                 index: i, name: r.name, type: r.content_type,
                 slug: getSlug(r), url: `https://nanoreview.net/en/${r.content_type}/${getSlug(r)}`,
@@ -160,8 +135,7 @@ export const setupRoutes = (fastify) => {
 
         const targetUrl = RANKING_URLS[type];
         if (!targetUrl) return reply.status(400).send({
-            success: false,
-            error: `Invalid type. Valid: ${Object.keys(RANKING_URLS).join(', ')}`,
+            success: false, error: `Invalid type. Valid: ${Object.keys(RANKING_URLS).join(', ')}`,
         });
 
         const t0 = Date.now();
@@ -169,9 +143,7 @@ export const setupRoutes = (fastify) => {
         try {
             const b = await getBrowserContext();
             browser = b.browser;
-            const context = b.context;
-
-            const data = await scrapeRankingPage(context, targetUrl);
+            const data = await scrapeRankingPage(b.context, targetUrl);
             data._ms = Date.now() - t0;
             return reply.send({ success: true, contentType: 'rankings', data });
         } catch (err) {
