@@ -1,6 +1,3 @@
-/**
- * api/server.js - Vercel serverless entry point
- */
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { setupRoutes } from '../routes.js';

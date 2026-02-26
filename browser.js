@@ -1,17 +1,13 @@
-/**
- * browser.js - Browser launch + navigation helpers
- * Creates a fresh browser+context per request (same as v1 — proven reliable).
- */
 import chromium from '@sparticuz/chromium';
 import { chromium as playwrightCore } from 'playwright-core';
 import { chromium as playwrightLocal } from 'playwright';
 
-const IS_VERCEL = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
-
 export const getBrowserContext = async () => {
+    const isVercel = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
     let browser;
 
-    if (IS_VERCEL) {
+    if (isVercel) {
+        // Vercel environment - use playwright-core with chromium
         const executablePath = await chromium.executablePath();
         browser = await playwrightCore.launch({
             args: [
@@ -24,10 +20,11 @@ export const getBrowserContext = async () => {
                 '--single-process',
             ],
             executablePath: executablePath || undefined,
-            headless: true,
+            headless: chromium.headless !== false ? true : chromium.headless,
             timeout: 30000,
         });
     } else {
+        // Local environment
         browser = await playwrightLocal.launch({
             headless: true,
             args: [
@@ -49,17 +46,34 @@ export const getBrowserContext = async () => {
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         },
+        // Increase timeout for slow responses
+        timeout: 30000,
     });
 
+    // Add stealth-like behavior without the plugin
     await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        window.chrome = { runtime: {} };
-        const orig = window.navigator.permissions.query;
-        window.navigator.permissions.query = (p) =>
-            p.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : orig(p);
+        // Override the navigator.webdriver property
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+        });
+
+        // Override the navigator.plugins to appear more real
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+        });
+
+        // Override chrome property
+        window.chrome = {
+            runtime: {},
+        };
+
+        // Override permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
     });
 
     return { browser, context };
@@ -71,20 +85,25 @@ export const waitForCloudflare = async (page, selector, timeout = 20000) => {
 
     while (Date.now() - start < timeout) {
         try {
+            // Check if we're past Cloudflare
             const title = await page.title().catch(() => '');
-            const url = page.url();
+            const url = await page.url().catch(() => '');
+
             const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
             const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
 
             if (!isChallenge && !isChallengeUrl) {
+                // Try to find the selector or just return if page seems loaded
                 try {
                     await page.waitForSelector(selector, { timeout: 2000, state: 'attached' });
                     return true;
                 } catch {
-                    const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100).catch(() => false);
+                    // Check if page at least has content
+                    const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
                     if (hasContent) return true;
                 }
             }
+
             await page.waitForTimeout(1000);
         } catch (error) {
             lastError = error;
@@ -92,31 +111,30 @@ export const waitForCloudflare = async (page, selector, timeout = 20000) => {
         }
     }
 
+    // One final check before failing
     try {
-        const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100).catch(() => false);
+        const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
         if (hasContent) return true;
     } catch {}
 
-    throw new Error(`Cloudflare timeout after ${timeout}ms: ${lastError?.message || 'Unknown'}`);
+    throw new Error(`Cloudflare timeout after ${timeout}ms: ${lastError?.message || 'Unknown error'}`);
 };
 
 export const safeNavigate = async (page, url, options = {}) => {
-    const defaultOptions = { waitUntil: 'domcontentloaded', timeout: 25000 };
+    const defaultOptions = {
+        waitUntil: 'domcontentloaded',
+        timeout: 25000,
+    };
+
     try {
         await page.goto(url, { ...defaultOptions, ...options });
         return true;
     } catch (error) {
+        // If navigation times out but we have content, that's okay
         try {
-            const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100).catch(() => false);
+            const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
             if (hasContent) return true;
         } catch {}
         throw error;
     }
-};
-
-export const blockResources = async (page, block = ['font', 'media', 'image', 'stylesheet']) => {
-    await page.route('**/*', (route) => {
-        if (block.includes(route.request().resourceType())) route.abort();
-        else route.continue();
-    });
 };
