@@ -20,7 +20,6 @@ const ALL_TYPES = ['phone', 'laptop', 'cpu', 'gpu', 'soc', 'tablet'];
 function detectTypes(query) {
     const q = query.toLowerCase().trim();
 
-    // Short/generic → search all types (catches "mobile", "cpu", "gpu", etc.)
     if (q.length <= 7 && !q.includes(' ')) return ALL_TYPES;
 
     if (/ryzen|intel\s*core|threadripper|xeon|celeron|pentium|core\s*i[3579]/i.test(q))
@@ -131,23 +130,32 @@ export async function searchAndFetch(query, limit = 10) {
     const best = pickBestMatch(results, query);
     if (!best) return null;
 
-    const url = deviceUrl(best);
-    const type = best.content_type || 'phone';
-    const slug = getSlug(best);
+    // Try top N candidates in case best match page fetch fails
+    const candidates = results.slice(0, Math.min(3, results.length));
+    const bestIdx = candidates.findIndex(r => r === best);
+    if (bestIdx > 0) { candidates.splice(bestIdx, 1); candidates.unshift(best); }
 
-    const data = await fetchDeviceData(type, slug, url);
-    if (!data) return null;
+    for (const candidate of candidates) {
+        const url = deviceUrl(candidate);
+        const type = candidate.content_type || 'phone';
+        const slug = getSlug(candidate);
 
-    data.searchResults = results.map((r, i) => ({
-        index: i,
-        name: r.name,
-        type: r.content_type,
-        slug: getSlug(r),
-    }));
-    data.matchedDevice = best.name;
+        const data = await fetchDeviceData(type, slug, url);
+        if (data) {
+            data.searchResults = results.map((r, i) => ({
+                index: i,
+                name: r.name,
+                type: r.content_type,
+                slug: getSlug(r),
+            }));
+            data.matchedDevice = candidate.name;
+            cache.set('device', cacheKey, data, TTL.device);
+            return data;
+        }
+        console.warn(`[scraper] fetchDeviceData returned null for ${slug}, trying next candidate`);
+    }
 
-    cache.set('device', cacheKey, data, TTL.device);
-    return data;
+    return null;
 }
 
 // ── Single device by URL ──────────────────────────────────────────────────
@@ -156,7 +164,6 @@ export async function scrapeDevicePage(url) {
     const cached = cache.get('device', url);
     if (cached) return cached;
 
-    // Extract type+slug from URL
     const m = url.match(/nanoreview\.net\/en\/([^/]+)\/([^/?#]+)/);
     if (!m) return null;
     const [, type, slug] = m;
@@ -175,9 +182,8 @@ export async function scrapeComparePage(compareUrl) {
     if (cached) return cached;
 
     const cookies = getCFCookies();
-    const html = await fetchHtml(compareUrl, { cookies, timeout: 10000 });
+    const html = await fetchHtml(compareUrl, { cookies, timeout: 12 });
 
-    // Try __NEXT_DATA__ first
     try {
         const m = html.match(/<script\s+id="__NEXT_DATA__"\s+type="application\/json">([^<]+)<\/script>/);
         if (m) {
@@ -199,7 +205,6 @@ export async function scrapeComparePage(compareUrl) {
         }
     } catch {}
 
-    // Fallback: parse HTML with cheerio
     const $ = cheerio.load(html);
     const data = {
         title: $('h1').first().text().trim(),
@@ -248,7 +253,7 @@ export async function scrapeRankingPage(rankingUrl) {
     if (cached) return cached;
 
     const cookies = getCFCookies();
-    const html = await fetchHtml(rankingUrl, { cookies, timeout: 10000 });
+    const html = await fetchHtml(rankingUrl, { cookies, timeout: 12 });
     const $ = cheerio.load(html);
 
     const data = {
@@ -257,7 +262,6 @@ export async function scrapeRankingPage(rankingUrl) {
         rankings: [],
     };
 
-    // Try __NEXT_DATA__ for structured ranking data
     try {
         const m = html.match(/<script\s+id="__NEXT_DATA__"\s+type="application\/json">([^<]+)<\/script>/);
         if (m) {
@@ -279,7 +283,6 @@ export async function scrapeRankingPage(rankingUrl) {
         }
     } catch {}
 
-    // Fallback: parse table
     const headers = [];
     $('table thead th').each((_, th) => headers.push($(th).text().trim()));
     $('table tbody tr').each((_, row) => {
