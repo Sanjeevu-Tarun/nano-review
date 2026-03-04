@@ -1,5 +1,7 @@
 /**
  * http.js - Direct HTTP client with gzip decompression + CF cookie support
+ *
+ * directSearch fires ALL type requests in parallel simultaneously for max speed.
  */
 import https from 'https';
 import http from 'http';
@@ -7,8 +9,8 @@ import zlib from 'zlib';
 
 const agent = new https.Agent({
     keepAlive: true,
-    maxSockets: 30,
-    maxFreeSockets: 15,
+    maxSockets: 50,
+    maxFreeSockets: 25,
     keepAliveMsecs: 60000,
 });
 
@@ -39,7 +41,7 @@ function decompress(buf, enc) {
     });
 }
 
-function nodeRequest(url, headers, timeoutMs = 6000, hops = 0) {
+function nodeRequest(url, headers, timeoutMs = 5000, hops = 0) {
     return new Promise((resolve, reject) => {
         if (hops > 5) return reject(new Error('Too many redirects'));
         let parsed;
@@ -80,12 +82,16 @@ function nodeRequest(url, headers, timeoutMs = 6000, hops = 0) {
     });
 }
 
-export async function directSearch(query, limit = 5, types = ['phone','laptop','cpu','gpu','soc','tablet'], cookies = '') {
+/**
+ * directSearch — fires ALL type requests truly in parallel using Promise.all.
+ * This is the primary speed optimization: all 6 types hit simultaneously.
+ */
+export async function directSearch(query, limit = 10, types = ['phone', 'laptop', 'cpu', 'gpu', 'soc', 'tablet'], cookies = '') {
     const headers = buildHeaders(cookies, true);
     const results = await Promise.all(types.map(async type => {
         const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
         try {
-            const { status, text } = await nodeRequest(url, headers, 5000);
+            const { status, text } = await nodeRequest(url, headers, 4000);
             if (status !== 200) return [];
             const data = JSON.parse(text);
             return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
@@ -94,7 +100,7 @@ export async function directSearch(query, limit = 5, types = ['phone','laptop','
     return results.flat();
 }
 
-export async function directFetchHtml(url, cookies = '', timeoutMs = 7000) {
+export async function directFetchHtml(url, cookies = '', timeoutMs = 6000) {
     const { status, text } = await nodeRequest(url, buildHeaders(cookies, false), timeoutMs);
     if (status >= 400) throw new Error(`HTTP ${status}`);
     if (/just a moment|checking your browser/i.test(text)) throw new Error('CF challenge');
