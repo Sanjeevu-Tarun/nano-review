@@ -2,13 +2,8 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { setupRoutes } from '../routes.js';
 
-const fastify = Fastify({ logger: true });
-
-fastify.register(cors, {
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
-});
-
+const fastify = Fastify({ logger: false });
+fastify.register(cors, { origin: '*', methods: ['GET', 'OPTIONS'] });
 setupRoutes(fastify);
 
 export default async function handler(req, res) {
