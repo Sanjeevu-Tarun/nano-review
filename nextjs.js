@@ -1,11 +1,8 @@
 /**
  * nextjs.js — Next.js JSON data extraction
- *
- * After the browser warms up and captures CF cookies, device data is
- * fetched fast via /_next/data/ JSON endpoint using a single browser page
- * that fires all fetches via page.evaluate() — no new page per request.
+ * Uses runFetch() (in-browser fetch on persistent page) — fast, no new navigations.
  */
-import { fetchPage, getContext } from './browser.js';
+import { runFetch, fetchPageHtml } from './browser.js';
 import { cache, TTL } from './cache.js';
 
 let _buildId = null;
@@ -20,7 +17,8 @@ async function getBuildId() {
         return _buildId;
     }
     try {
-        const html = await fetchPage('https://nanoreview.net/en/');
+        // Fetch the home page HTML to extract buildId
+        const html = await runFetch('https://nanoreview.net/en/', { isJson: false });
         const m = html.match(/"buildId"\s*:\s*"([^"]+)"/);
         if (m) {
             _buildId = m[1];
@@ -36,8 +34,7 @@ async function getBuildId() {
 }
 
 export function invalidateBuildId() {
-    _buildId = null;
-    _buildIdExpiry = 0;
+    _buildId = null; _buildIdExpiry = 0;
     cache.del('meta', 'buildId');
 }
 
@@ -45,9 +42,7 @@ const DEVICE_KEYS = ['device', 'phone', 'laptop', 'cpu', 'gpu', 'soc', 'tablet',
 
 function extractDevice(props) {
     if (!props) return null;
-    for (const key of DEVICE_KEYS) {
-        if (props[key]?.name) return props[key];
-    }
+    for (const key of DEVICE_KEYS) { if (props[key]?.name) return props[key]; }
     for (const val of Object.values(props)) {
         if (val && typeof val === 'object' && !Array.isArray(val) && val.name && (val.specs || val.params || val.scores)) return val;
     }
@@ -55,8 +50,7 @@ function extractDevice(props) {
 }
 
 function parseNextData(html, sourceUrl) {
-    if (!html) return null;
-    const m = html.match(/<script\s+id="__NEXT_DATA__"\s+type="application\/json">([^<]+)<\/script>/);
+    const m = html?.match(/<script\s+id="__NEXT_DATA__"\s+type="application\/json">([^<]+)<\/script>/);
     if (!m) return null;
     try {
         const d = extractDevice(JSON.parse(m[1])?.props?.pageProps);
@@ -89,55 +83,21 @@ function normalizeDeviceData(d, sourceUrl) {
     } else if (d.params && typeof d.params === 'object') Object.assign(specs, d.params);
 
     const scores = {};
-    if (Array.isArray(d.scores)) { for (const s of d.scores) { if (s.name && s.value != null) scores[s.name] = String(s.value); } }
+    if (Array.isArray(d.scores)) { for (const s of d.scores) { if (s.name != null && s.value != null) scores[s.name] = String(s.value); } }
     else if (d.scores && typeof d.scores === 'object') Object.assign(scores, d.scores);
-    for (const k of ['total_score', 'score', 'rating', 'nanoreview_score']) { if (d[k] != null) scores[k] = String(d[k]); }
+    for (const k of ['total_score','score','rating','nanoreview_score']) { if (d[k] != null) scores[k] = String(d[k]); }
 
     const toStr = x => typeof x === 'string' ? x : x?.text || x?.name || '';
     return {
         title: d.name || d.title || '',
         sourceUrl,
-        images: [...new Set([d.image, d.image_url, ...(d.images || [])].filter(Boolean))],
+        images: [...new Set([d.image, d.image_url, ...(d.images||[])].filter(Boolean))],
         scores,
-        pros: [...new Set([...(d.pros || []), ...(d.advantages || [])].map(toStr).filter(Boolean))],
-        cons: [...new Set([...(d.cons || []), ...(d.disadvantages || [])].map(toStr).filter(Boolean))],
+        pros: [...new Set([...(d.pros||[]),...(d.advantages||[])].map(toStr).filter(Boolean))],
+        cons: [...new Set([...(d.cons||[]),...(d.disadvantages||[])].map(toStr).filter(Boolean))],
         specs,
         _source: 'next_data',
     };
-}
-
-// Fetch JSON via browser's own fetch() — inherits CF session, no new page needed
-async function fetchJsonViaBrowser(url) {
-    const ctx = await getContext();
-    const page = await ctx.newPage();
-    try {
-        // Navigate to base domain so fetch() shares the CF session
-        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-        // Wait for CF
-        const deadline = Date.now() + 12000;
-        while (Date.now() < deadline) {
-            const title = await page.title().catch(() => '');
-            if (!/just a moment|checking your browser/i.test(title)) break;
-            await page.waitForTimeout(800);
-        }
-
-        const result = await page.evaluate(async (fetchUrl) => {
-            try {
-                const res = await fetch(fetchUrl, {
-                    headers: { accept: 'application/json' },
-                    signal: AbortSignal.timeout(8000),
-                });
-                if (!res.ok) return { error: res.status };
-                return { data: await res.json() };
-            } catch (e) { return { error: String(e) }; }
-        }, url);
-
-        if (result.error) throw new Error(`Browser fetch error: ${result.error}`);
-        return result.data;
-    } finally {
-        await page.close().catch(() => {});
-    }
 }
 
 export async function fetchDeviceData(contentType, slug, sourceUrl) {
@@ -145,12 +105,13 @@ export async function fetchDeviceData(contentType, slug, sourceUrl) {
     const cached = cache.get('device', cacheKey);
     if (cached) { console.log(`[nextjs] cache hit: ${slug}`); return cached; }
 
-    // Strategy 1: /_next/data/ JSON via browser fetch
+    // Strategy 1: /_next/data/ JSON — fast, no HTML parsing
     const buildId = await getBuildId();
     if (buildId) {
         const jsonUrl = `https://nanoreview.net/_next/data/${buildId}/en/${contentType}/${slug}.json`;
         try {
-            const json = await fetchJsonViaBrowser(jsonUrl);
+            const text = await runFetch(jsonUrl, { isJson: true });
+            const json = JSON.parse(text);
             const d = extractDevice(json?.pageProps);
             if (d?.name) {
                 const result = normalizeDeviceData(d, sourceUrl);
@@ -166,18 +127,17 @@ export async function fetchDeviceData(contentType, slug, sourceUrl) {
 
     // Strategy 2: Full page HTML + __NEXT_DATA__
     try {
-        const html = await fetchPage(sourceUrl);
+        const html = await fetchPageHtml(sourceUrl);
         const result = parseNextData(html, sourceUrl);
         if (result?.title) {
             cache.set('device', cacheKey, result, TTL.device);
             console.log(`[nextjs] __NEXT_DATA__ extracted: ${slug}`);
             return result;
         }
-        console.warn(`[nextjs] No device data found for ${slug}`);
+        console.warn(`[nextjs] No device data for ${slug}`);
     } catch (err) {
-        console.warn(`[nextjs] HTML fetch failed for ${slug}:`, err.message);
+        console.warn(`[nextjs] page fetch failed for ${slug}:`, err.message);
     }
-
     return null;
 }
 

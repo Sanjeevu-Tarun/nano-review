@@ -4,11 +4,10 @@
  * Uses parallelSearchInBrowser() for CF-bypass search,
  * then fetchDeviceData() for fast Next.js JSON extraction.
  */
-import { parallelSearchInBrowser } from './browser.js';
+import { parallelSearchInBrowser, fetchPageHtml } from './browser.js';
 import { fetchDeviceData } from './nextjs.js';
 import { cache, TTL } from './cache.js';
 import * as cheerio from 'cheerio';
-import { fetchPage } from './browser.js';
 
 const ALL_TYPES = ['phone', 'laptop', 'cpu', 'gpu', 'soc', 'tablet'];
 
@@ -137,7 +136,7 @@ export async function scrapeComparePage(compareUrl) {
     const cached = cache.get('compare', compareUrl);
     if (cached) return cached;
 
-    const html = await fetchPage(compareUrl);
+    const html = await fetchPageHtml(compareUrl);
 
     try {
         const m = html.match(/<script\s+id="__NEXT_DATA__"\s+type="application\/json">([^<]+)<\/script>/);
@@ -188,7 +187,7 @@ export async function scrapeRankingPage(rankingUrl) {
     const cached = cache.get('ranking', rankingUrl);
     if (cached) return cached;
 
-    const html = await fetchPage(rankingUrl);
+    const html = await fetchPageHtml(rankingUrl);
     const $ = cheerio.load(html);
     const data = { title: $('h1').first().text().trim(), sourceUrl: rankingUrl, rankings: [] };
 

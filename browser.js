@@ -1,26 +1,29 @@
 /**
- * browser.js — Persistent Playwright browser pool
- * Uses system Chromium installed via apt-get in Dockerfile.
+ * browser.js — Browser pool with CF session management
+ *
+ * Strategy:
+ * 1. On startup: open ONE page, load nanoreview.net, solve CF challenge, store cookies
+ * 2. All subsequent requests: use a persistent page that stays open at nanoreview.net
+ *    and makes fetch() calls from inside it — no new navigations
+ * 3. If CF challenge appears again: re-solve on the persistent page
  */
 import { chromium } from 'playwright-core';
 
 let _browser = null;
 let _context = null;
-let _cfCookies = '';
-let _cfExpiry = 0;
-const CF_TTL = 25 * 60 * 1000;
+let _activePage = null;      // persistent page kept alive at nanoreview.net
+let _pageReady = false;      // true = page is at nanoreview.net and past CF
+let _initPromise = null;     // deduplicate concurrent init calls
 
-async function launchBrowser() {
+const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/chromium';
+const BASE_URL = 'https://nanoreview.net/en/';
+
+// ── Launch ────────────────────────────────────────────────────────────────
+
+async function launch() {
     console.log('[browser] Launching Chromium...');
-
-    // Use system chromium — set via PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH env or find automatically
-    const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
-        || process.env.CHROMIUM_PATH
-        || '/usr/bin/chromium'
-        || '/usr/bin/chromium-browser';
-
     const browser = await chromium.launch({
-        executablePath,
+        executablePath: CHROMIUM_PATH,
         headless: true,
         args: [
             '--no-sandbox',
@@ -28,9 +31,8 @@ async function launchBrowser() {
             '--disable-dev-shm-usage',
             '--disable-gpu',
             '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process',
-            '--single-process',
             '--no-zygote',
+            '--single-process',
         ],
         timeout: 30000,
     });
@@ -40,133 +42,188 @@ async function launchBrowser() {
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         locale: 'en-US',
         timezoneId: 'America/New_York',
-        extraHTTPHeaders: {
-            'accept-language': 'en-US,en;q=0.9',
-        },
+        extraHTTPHeaders: { 'accept-language': 'en-US,en;q=0.9' },
     });
 
     await context.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         window.chrome = { runtime: {} };
-        const orig = window.navigator.permissions.query;
-        window.navigator.permissions.query = (p) =>
-            p.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : orig(p);
     });
 
     browser.on('disconnected', () => {
-        console.warn('[browser] Disconnected — will relaunch on next request');
-        _browser = null;
-        _context = null;
+        console.warn('[browser] Disconnected, resetting state');
+        _browser = null; _context = null; _activePage = null; _pageReady = false; _initPromise = null;
     });
 
     console.log('[browser] Chromium ready ✅');
-    return { browser, context };
-}
-
-export async function getContext() {
-    if (_browser && _context) return _context;
-    const { browser, context } = await launchBrowser();
     _browser = browser;
     _context = context;
-    return _context;
+    return context;
 }
 
-export function getCFCookies() {
-    if (_cfCookies && Date.now() < _cfExpiry) return _cfCookies;
-    return '';
-}
+// ── CF challenge waiter ───────────────────────────────────────────────────
 
-function storeCFCookies(cookies) {
-    const cf = cookies.filter(c =>
-        c.name === 'cf_clearance' || c.name.startsWith('__cf') || c.name === '_cfuvid'
-    );
-    if (cf.length) {
-        _cfCookies = cf.map(c => `${c.name}=${c.value}`).join('; ');
-        _cfExpiry = Date.now() + CF_TTL;
-        console.log('[browser] CF cookies stored:', cf.map(c => c.name).join(', '));
-    }
-}
-
-async function waitForCF(page, timeout = 15000) {
-    const deadline = Date.now() + timeout;
+async function waitForCF(page, timeoutMs = 20000) {
+    const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         const title = await page.title().catch(() => '');
-        if (!/just a moment|attention required|checking your browser/i.test(title)) return;
-        await page.waitForTimeout(1000);
+        const url = page.url();
+        if (
+            !/just a moment|attention required|checking your browser/i.test(title) &&
+            !/cdn-cgi\/challenge/i.test(url)
+        ) return true;
+        console.log('[browser] Waiting for CF challenge...');
+        await page.waitForTimeout(1500);
     }
+    return false; // timed out but continue anyway
 }
 
-export async function fetchPage(url, { timeout = 25000 } = {}) {
-    const ctx = await getContext();
-    const page = await ctx.newPage();
+// ── Persistent active page ────────────────────────────────────────────────
+// This page stays open at nanoreview.net. All fetch() calls go through it.
+
+async function ensureActivePage() {
+    // Already ready
+    if (_activePage && _pageReady) return _activePage;
+
+    // Deduplicate concurrent calls
+    if (_initPromise) return _initPromise;
+
+    _initPromise = (async () => {
+        try {
+            const ctx = _context || await launch();
+
+            if (!_activePage || _activePage.isClosed()) {
+                _activePage = await ctx.newPage();
+
+                // Block heavy resources on this page too
+                await _activePage.route('**/*', route => {
+                    const t = route.request().resourceType();
+                    if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
+                    else route.continue();
+                });
+            }
+
+            console.log('[browser] Navigating to nanoreview.net...');
+            await _activePage.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await waitForCF(_activePage);
+
+            _pageReady = true;
+            console.log('[browser] Active page ready at nanoreview.net ✅');
+            return _activePage;
+        } finally {
+            _initPromise = null;
+        }
+    })();
+
+    return _initPromise;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────
+
+/**
+ * runFetch — execute a fetch() from inside the persistent browser page.
+ * Fast: no navigation, inherits CF cookies, reuses existing session.
+ */
+export async function runFetch(url, { isJson = true } = {}) {
+    const page = await ensureActivePage();
+
+    const result = await page.evaluate(async ({ url, isJson }) => {
+        try {
+            const res = await fetch(url, {
+                headers: { accept: isJson ? 'application/json' : 'text/html,*/*' },
+                signal: AbortSignal.timeout(10000),
+            });
+            if (!res.ok) return { error: res.status, status: res.status };
+            const text = await res.text();
+            return { text, status: res.status };
+        } catch (e) { return { error: String(e) }; }
+    }, { url, isJson });
+
+    if (result.error) {
+        // If CF kicked us out, reset page readiness and retry once
+        if (result.status === 403 || result.status === 503) {
+            console.warn('[browser] CF blocked fetch, re-warming page...');
+            _pageReady = false;
+            const page2 = await ensureActivePage();
+            const retry = await page2.evaluate(async ({ url, isJson }) => {
+                try {
+                    const res = await fetch(url, {
+                        headers: { accept: isJson ? 'application/json' : 'text/html,*/*' },
+                        signal: AbortSignal.timeout(10000),
+                    });
+                    if (!res.ok) return { error: res.status };
+                    return { text: await res.text(), status: res.status };
+                } catch (e) { return { error: String(e) }; }
+            }, { url, isJson });
+            if (retry.error) throw new Error(`Fetch failed after retry: ${retry.error}`);
+            return retry.text;
+        }
+        throw new Error(`Fetch error for ${url}: ${result.error}`);
+    }
+
+    return result.text;
+}
+
+/**
+ * parallelSearchInBrowser — fire all type searches simultaneously from inside browser.
+ */
+export async function parallelSearchInBrowser(query, limit, types) {
+    const page = await ensureActivePage();
+
+    const results = await page.evaluate(async ({ query, limit, types }) => {
+        const all = await Promise.all(types.map(async type => {
+            try {
+                const res = await fetch(
+                    `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`,
+                    { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(7000) }
+                );
+                if (!res.ok) return [];
+                const data = await res.json();
+                return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
+            } catch { return []; }
+        }));
+        return all.flat();
+    }, { query, limit, types });
+
+    return results;
+}
+
+/**
+ * fetchPageHtml — navigate a TEMPORARY page and get HTML.
+ * Used only for device pages (not search). Separate from active page.
+ */
+export async function fetchPageHtml(url) {
+    // Ensure we have a context (may trigger launch if first call)
+    if (!_context) await ensureActivePage();
+
+    const page = await _context.newPage();
     try {
         await page.route('**/*', route => {
             const t = route.request().resourceType();
             if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
             else route.continue();
         });
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
-        await waitForCF(page);
-        const cookies = await ctx.cookies();
-        storeCFCookies(cookies);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await waitForCF(page, 15000);
         return await page.content();
     } finally {
         await page.close().catch(() => {});
     }
 }
 
-export async function parallelSearchInBrowser(query, limit, types) {
-    const ctx = await getContext();
-    const page = await ctx.newPage();
-    try {
-        await page.route('**/*', route => {
-            const t = route.request().resourceType();
-            if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
-            else route.continue();
-        });
-
-        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 25000 });
-        await waitForCF(page);
-
-        const results = await page.evaluate(async ({ query, limit, types }) => {
-            const all = await Promise.all(types.map(async type => {
-                try {
-                    const res = await fetch(
-                        `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`,
-                        { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(6000) }
-                    );
-                    if (!res.ok) return [];
-                    const data = await res.json();
-                    return Array.isArray(data)
-                        ? data.map(r => ({ ...r, content_type: r.content_type || type }))
-                        : [];
-                } catch { return []; }
-            }));
-            return all.flat();
-        }, { query, limit, types });
-
-        const cookies = await ctx.cookies();
-        storeCFCookies(cookies);
-        return results;
-    } finally {
-        await page.close().catch(() => {});
-    }
-}
-
 export async function warmupBrowser() {
-    console.log('[browser] Warming up...');
+    console.log('[browser] Warming up (establishing CF session)...');
     const t = Date.now();
     try {
-        await fetchPage('https://nanoreview.net/en/');
-        console.log(`[browser] Warm-up done in ${Date.now() - t}ms. CF cookies: ${!!getCFCookies()}`);
+        await ensureActivePage();
+        console.log(`[browser] Warm-up done in ${Date.now() - t}ms ✅`);
     } catch (err) {
         console.warn('[browser] Warm-up failed:', err.message);
     }
 }
 
 export async function destroyBrowser() {
-    if (_browser) { await _browser.close().catch(() => {}); _browser = null; _context = null; }
+    if (_browser) { await _browser.close().catch(() => {}); }
+    _browser = null; _context = null; _activePage = null; _pageReady = false;
 }
