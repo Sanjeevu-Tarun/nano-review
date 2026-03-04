@@ -1,31 +1,28 @@
 /**
  * tls.js — Chrome TLS fingerprint impersonation client
  *
- * Uses `tlsclientwrapper` — ESM-native, Koffi FFI bindings to bogdanfinn/tls-client.
- * Impersonates Chrome 131's exact JA3/JA4 + HTTP/2 SETTINGS fingerprints,
- * bypassing Cloudflare at the TLS layer with zero browser overhead.
+ * Uses node-tls-client@2.1.0 (CJS package wrapping bogdanfinn/tls-client in Go).
+ * Imported via createRequire — the standard ESM pattern for CJS-only packages.
  *
- * Architecture:
- * - ModuleClient: manages a Piscina worker thread pool (one per CPU)
- * - SessionClient: one session per logical request group, reused across calls
- * - CF cookies: extracted after first request, cached 25 min, reused everywhere
+ * Impersonates Chrome 131 JA3 + HTTP/2 fingerprint → bypasses Cloudflare without
+ * a browser. CF cookies cached 25 min, reused on every subsequent request.
  *
- * Speed: ~80-200ms warm (session reuse), ~300-600ms cold (new TLS handshake)
- * RAM:   ~30-50MB (vs 300-500MB for Playwright)
+ * Speed: ~80-200ms warm, ~300-600ms cold. RAM: ~30-50MB (vs 300-500MB Playwright).
  */
-
-import { ModuleClient, SessionClient } from 'tlsclientwrapper';
+import { createRequire } from 'module';
 import https from 'https';
 import zlib from 'zlib';
 import { promisify } from 'util';
 
-const gunzip          = promisify(zlib.gunzip);
-const inflate         = promisify(zlib.inflate);
+const require = createRequire(import.meta.url);
+const { Session, initTLS, destroyTLS: _destroyTLS } = require('node-tls-client');
+
+const gunzip           = promisify(zlib.gunzip);
+const inflate          = promisify(zlib.inflate);
 const brotliDecompress = promisify(zlib.brotliDecompress);
 
-// ── Worker pool (singleton) ───────────────────────────────────────────────
+// ── Session singleton ─────────────────────────────────────────────────────
 
-let _module = null;
 let _session = null;
 let _initPromise = null;
 
@@ -34,23 +31,17 @@ async function getSession() {
     if (_initPromise) return _initPromise;
 
     _initPromise = (async () => {
-        _module = new ModuleClient({
-            maxThreads: 2, // 2 threads is plenty for Render free tier (1 vCPU)
-        });
-
-        _session = new SessionClient(_module, {
-            tlsClientIdentifier: 'chrome_131',
-            // Retry on rate-limit and CF 503 automatically
-            retryIsEnabled: true,
-            retryMaxCount: 2,
-            retryStatusCodes: [429, 503],
-            retryDelay: 500,
-            followRedirects: true,
+        await initTLS();
+        _session = new Session({
+            clientIdentifier: 'chrome_131',
+            randomTlsExtensionOrder: true,
+            timeout: 10,        // seconds
             insecureSkipVerify: false,
+            forceHttp1: false,
+            debug: false,
         });
-
         _initPromise = null;
-        console.log('[tls] tlsclientwrapper session ready (chrome_131)');
+        console.log('[tls] node-tls-client session ready (chrome_131)');
         return _session;
     })();
 
@@ -61,17 +52,18 @@ async function getSession() {
 
 let _cfCookies = '';
 let _cfExpiry  = 0;
-const CF_TTL   = 25 * 60 * 1000; // 25 min (CF clears at 30)
+const CF_TTL   = 25 * 60 * 1000;
 
 export function getCFCookies() {
     if (_cfCookies && Date.now() < _cfExpiry) return _cfCookies;
     return '';
 }
 
-function extractCFCookies(headers) {
-    // headers is a plain object from tlsclientwrapper — find set-cookie
-    const raw = headers?.['set-cookie'] || headers?.['Set-Cookie'] || '';
-    const lines = Array.isArray(raw) ? raw : raw ? raw.split('\n') : [];
+function extractCFCookies(resp) {
+    // node-tls-client stores cookies on the session automatically,
+    // but we also extract them from headers for manual injection
+    const raw = resp.headers?.['set-cookie'] || '';
+    const lines = Array.isArray(raw) ? raw : (raw ? raw.split('\n') : []);
 
     const cfPairs = [];
     for (const line of lines) {
@@ -121,27 +113,20 @@ export async function tlsGet(url, { cookies = '', isJson = false, timeout = 8000
     const session = await getSession();
     const headers = buildHeaders(cookies, isJson);
 
-    const resp = await session.get(url, {
-        headers,
-        timeoutSeconds: Math.ceil(timeout / 1000),
-    });
+    const resp = await session.get(url, { headers });
 
-    // Extract CF cookies if present
-    if (resp.headers) extractCFCookies(resp.headers);
+    // Extract any CF cookies from response
+    extractCFCookies(resp);
 
     const status = resp.status;
-
     if (status === 403 || status === 429 || status === 503) {
         throw new Error(`HTTP ${status} — Cloudflare block`);
     }
 
-    // tlsclientwrapper returns body as string already decoded
-    const text = typeof resp.body === 'string'
-        ? resp.body
-        : JSON.stringify(resp.body);
+    const text = await resp.text();
 
     if (/just a moment|checking your browser|_cf_chl_opt/i.test(text)) {
-        throw new Error('CF JS challenge — TLS fingerprint not sufficient for this request');
+        throw new Error('CF JS challenge — TLS fingerprint not sufficient');
     }
 
     return { status, text };
@@ -149,21 +134,19 @@ export async function tlsGet(url, { cookies = '', isJson = false, timeout = 8000
 
 // ── High-level helpers ────────────────────────────────────────────────────
 
-/** Fetch HTML — throws on CF block or HTTP error */
 export async function fetchHtml(url, { cookies = '', timeout = 7000 } = {}) {
     const { status, text } = await tlsGet(url, { cookies, isJson: false, timeout });
     if (status >= 400) throw new Error(`HTTP ${status} from ${url}`);
     return text;
 }
 
-/** Fetch JSON — parses response body */
 export async function fetchJson(url, { cookies = '', timeout = 5000 } = {}) {
     const { status, text } = await tlsGet(url, { cookies, isJson: true, timeout });
     if (status >= 400) throw new Error(`HTTP ${status} from ${url}`);
     return JSON.parse(text);
 }
 
-// ── Parallel search (raw Node HTTPS — search endpoint doesn't need TLS spoof) ─
+// ── Parallel search — raw Node HTTPS (no TLS spoof needed for /api/search) ─
 
 const _agent = new https.Agent({ keepAlive: true, maxSockets: 40, keepAliveMsecs: 30000 });
 
@@ -177,10 +160,6 @@ async function decompressBody(buf, enc) {
     return buf.toString('utf8');
 }
 
-/**
- * parallelSearch — fires all type searches simultaneously using raw Node HTTPS.
- * /api/search doesn't need TLS impersonation — it's a plain JSON API.
- */
 export function parallelSearch(query, limit, types) {
     const cfCookies = getCFCookies();
     const headers = {
@@ -227,7 +206,8 @@ export function parallelSearch(query, limit, types) {
     }))).then(arrays => arrays.flat());
 }
 
-/** One-time warm-up: establish session + get CF clearance cookie */
+// ── Lifecycle ─────────────────────────────────────────────────────────────
+
 export async function warmupTLS() {
     console.log('[tls] Warming up (establishing CF clearance)...');
     const t = Date.now();
@@ -239,12 +219,10 @@ export async function warmupTLS() {
     }
 }
 
-/** Cleanup — call on process exit if needed */
 export async function destroyTLS() {
     try {
-        if (_session) await _session.destroySession();
-        if (_module)  await _module.terminate();
+        if (_session) await _session.close();
+        await _destroyTLS();
     } catch {}
     _session = null;
-    _module  = null;
 }
