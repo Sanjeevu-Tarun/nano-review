@@ -1,7 +1,7 @@
 {
   "name": "nanoreview-api",
   "version": "5.0.0",
-  "description": "NanoReview unofficial API — Playwright browser + Next.js JSON extraction",
+  "description": "NanoReview unofficial API — Playwright + Next.js JSON extraction",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@fastify/cors": "^10.0.0",
-    "@sparticuz/chromium": "^133.0.0",
     "cheerio": "^1.2.0",
     "dotenv": "^17.3.1",
     "fastify": "^5.7.3",
