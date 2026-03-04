@@ -1,52 +1,32 @@
 /**
- * tls.js — Chrome TLS fingerprint impersonation client
+ * tls.js — HTTP client using curl-impersonate-chrome
  *
- * Uses node-tls-client@2.1.0 (CJS package wrapping bogdanfinn/tls-client in Go).
- * Imported via createRequire — the standard ESM pattern for CJS-only packages.
+ * STRATEGY:
+ * curl-impersonate is a patched curl binary compiled to produce the EXACT same
+ * TLS ClientHello (JA3/JA4) and HTTP/2 SETTINGS as a real Chrome 131 browser.
+ * It's installed directly in the Docker image — no runtime downloads, no npm
+ * packages that phone home to GitHub, 100% offline capable.
  *
- * Impersonates Chrome 131 JA3 + HTTP/2 fingerprint → bypasses Cloudflare without
- * a browser. CF cookies cached 25 min, reused on every subsequent request.
+ * Cloudflare sees Chrome's fingerprint → issues cf_clearance → cached 25 min.
  *
- * Speed: ~80-200ms warm, ~300-600ms cold. RAM: ~30-50MB (vs 300-500MB Playwright).
+ * FALLBACK:
+ * /api/search on nanoreview.net works fine with plain Node HTTPS (no CF block),
+ * so we use raw https.request for parallel search — much faster than curl spawn.
  */
-import { createRequire } from 'module';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import https from 'https';
 import zlib from 'zlib';
-import { promisify } from 'util';
 
-const require = createRequire(import.meta.url);
-const { Session, initTLS, destroyTLS: _destroyTLS } = require('node-tls-client');
-
+const execFileAsync = promisify(execFile);
 const gunzip           = promisify(zlib.gunzip);
 const inflate          = promisify(zlib.inflate);
 const brotliDecompress = promisify(zlib.brotliDecompress);
 
-// ── Session singleton ─────────────────────────────────────────────────────
+// Path to curl-impersonate-chrome binary (installed in Dockerfile)
+const CURL_BIN = process.env.CURL_IMPERSONATE_BIN || 'curl_chrome131';
 
-let _session = null;
-let _initPromise = null;
-
-async function getSession() {
-    if (_session) return _session;
-    if (_initPromise) return _initPromise;
-
-    _initPromise = (async () => {
-        await initTLS();
-        _session = new Session({
-            clientIdentifier: 'chrome_131',
-            randomTlsExtensionOrder: true,
-            timeout: 10,        // seconds
-            insecureSkipVerify: false,
-            forceHttp1: false,
-            debug: false,
-        });
-        _initPromise = null;
-        console.log('[tls] node-tls-client session ready (chrome_131)');
-        return _session;
-    })();
-
-    return _initPromise;
-}
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 // ── CF Cookie Store ───────────────────────────────────────────────────────
 
@@ -59,94 +39,132 @@ export function getCFCookies() {
     return '';
 }
 
-function extractCFCookies(resp) {
-    // node-tls-client stores cookies on the session automatically,
-    // but we also extract them from headers for manual injection
-    const raw = resp.headers?.['set-cookie'] || '';
-    const lines = Array.isArray(raw) ? raw : (raw ? raw.split('\n') : []);
-
+function parseCFCookies(setCookieLines) {
     const cfPairs = [];
-    for (const line of lines) {
-        const m = line.match(/^([^=]+)=([^;]*)/);
+    for (const line of setCookieLines) {
+        const m = line.match(/^([^=\s]+)=([^;]*)/);
         if (!m) continue;
         const name = m[1].trim();
         if (name === 'cf_clearance' || name.startsWith('__cf') || name === '_cfuvid') {
             cfPairs.push(`${name}=${m[2]}`);
         }
     }
-
     if (cfPairs.length) {
         _cfCookies = cfPairs.join('; ');
         _cfExpiry  = Date.now() + CF_TTL;
-        console.log('[tls] CF cookies captured:', cfPairs.map(p => p.split('=')[0]).join(', '));
+        console.log('[curl] CF cookies captured:', cfPairs.map(p => p.split('=')[0]).join(', '));
     }
 }
 
-// ── Header builder ────────────────────────────────────────────────────────
+// ── curl-impersonate fetch ────────────────────────────────────────────────
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+/**
+ * curlFetch — spawns curl_chrome131 to fetch a URL with Chrome's TLS fingerprint.
+ * Returns { status, text, setCookies }.
+ */
+export async function curlFetch(url, { cookies = '', timeout = 10 } = {}) {
+    const allCookies = [getCFCookies(), cookies].filter(Boolean).join('; ');
 
-function buildHeaders(extraCookies = '', isJson = false) {
-    const allCookies = [getCFCookies(), extraCookies].filter(Boolean).join('; ');
-    return {
-        'accept': isJson
-            ? 'application/json, */*;q=0.8'
-            : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'accept-language': 'en-US,en;q=0.9',
-        'accept-encoding': 'gzip, deflate, br',
-        'user-agent': UA,
-        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': isJson ? 'empty' : 'document',
-        'sec-fetch-mode': isJson ? 'cors' : 'navigate',
-        'sec-fetch-site': 'same-origin',
-        'sec-fetch-user': '?1',
-        'referer': 'https://nanoreview.net/',
-        ...(allCookies ? { 'cookie': allCookies } : {}),
-    };
-}
+    const args = [
+        '--silent',
+        '--compressed',                   // handle gzip/br automatically
+        '--location',                      // follow redirects
+        '--max-redirs', '5',
+        '--max-time', String(timeout),
+        '--write-out', '\n__STATUS__%{http_code}',  // append status at end
+        '-D', '-',                         // dump headers to stdout too
+        '-H', `accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8`,
+        '-H', `accept-language: en-US,en;q=0.9`,
+        '-H', `user-agent: ${UA}`,
+        '-H', `sec-ch-ua: "Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`,
+        '-H', `sec-ch-ua-mobile: ?0`,
+        '-H', `sec-ch-ua-platform: "Windows"`,
+        '-H', `sec-fetch-dest: document`,
+        '-H', `sec-fetch-mode: navigate`,
+        '-H', `sec-fetch-site: same-origin`,
+        '-H', `sec-fetch-user: ?1`,
+        '-H', `referer: https://nanoreview.net/`,
+        ...(allCookies ? ['-H', `cookie: ${allCookies}`] : []),
+        url,
+    ];
 
-// ── Core GET ──────────────────────────────────────────────────────────────
+    const { stdout, stderr } = await execFileAsync(CURL_BIN, args, {
+        maxBuffer: 10 * 1024 * 1024, // 10MB
+        timeout: (timeout + 5) * 1000,
+    });
 
-export async function tlsGet(url, { cookies = '', isJson = false, timeout = 8000 } = {}) {
-    const session = await getSession();
-    const headers = buildHeaders(cookies, isJson);
+    // Parse: headers block + body + status marker
+    const statusMatch = stdout.match(/__STATUS__(\d+)$/m);
+    const status = statusMatch ? parseInt(statusMatch[1]) : 200;
 
-    const resp = await session.get(url, { headers });
+    // Split headers from body (separated by \r\n\r\n)
+    const headerEnd = stdout.indexOf('\r\n\r\n');
+    const headersRaw = headerEnd > -1 ? stdout.slice(0, headerEnd) : '';
+    const body = headerEnd > -1
+        ? stdout.slice(headerEnd + 4).replace(/__STATUS__\d+$/, '').trim()
+        : stdout.replace(/__STATUS__\d+$/, '').trim();
 
-    // Extract any CF cookies from response
-    extractCFCookies(resp);
+    // Extract set-cookie lines
+    const setCookies = [];
+    for (const line of headersRaw.split('\r\n')) {
+        if (/^set-cookie:/i.test(line)) {
+            setCookies.push(line.slice(line.indexOf(':') + 1).trim());
+        }
+    }
+    if (setCookies.length) parseCFCookies(setCookies);
 
-    const status = resp.status;
     if (status === 403 || status === 429 || status === 503) {
         throw new Error(`HTTP ${status} — Cloudflare block`);
     }
 
-    const text = await resp.text();
-
-    if (/just a moment|checking your browser|_cf_chl_opt/i.test(text)) {
-        throw new Error('CF JS challenge — TLS fingerprint not sufficient');
+    if (/just a moment|checking your browser|_cf_chl_opt/i.test(body)) {
+        throw new Error('CF JS challenge page returned');
     }
 
-    return { status, text };
+    return { status, text: body };
 }
 
 // ── High-level helpers ────────────────────────────────────────────────────
 
-export async function fetchHtml(url, { cookies = '', timeout = 7000 } = {}) {
-    const { status, text } = await tlsGet(url, { cookies, isJson: false, timeout });
+export async function fetchHtml(url, { cookies = '', timeout = 10 } = {}) {
+    const { status, text } = await curlFetch(url, { cookies, timeout });
     if (status >= 400) throw new Error(`HTTP ${status} from ${url}`);
     return text;
 }
 
-export async function fetchJson(url, { cookies = '', timeout = 5000 } = {}) {
-    const { status, text } = await tlsGet(url, { cookies, isJson: true, timeout });
+export async function fetchJson(url, { cookies = '', timeout = 8 } = {}) {
+    const allCookies = [getCFCookies(), cookies].filter(Boolean).join('; ');
+
+    const args = [
+        '--silent', '--compressed', '--location', '--max-redirs', '3',
+        '--max-time', String(timeout),
+        '--write-out', '\n__STATUS__%{http_code}',
+        '-H', `accept: application/json, */*;q=0.8`,
+        '-H', `accept-language: en-US,en;q=0.9`,
+        '-H', `user-agent: ${UA}`,
+        '-H', `sec-fetch-dest: empty`,
+        '-H', `sec-fetch-mode: cors`,
+        '-H', `sec-fetch-site: same-origin`,
+        '-H', `referer: https://nanoreview.net/`,
+        ...(allCookies ? ['-H', `cookie: ${allCookies}`] : []),
+        url,
+    ];
+
+    const { stdout } = await execFileAsync(CURL_BIN, args, {
+        maxBuffer: 5 * 1024 * 1024,
+        timeout: (timeout + 5) * 1000,
+    });
+
+    const statusMatch = stdout.match(/__STATUS__(\d+)$/m);
+    const status = statusMatch ? parseInt(statusMatch[1]) : 200;
+    const text = stdout.replace(/__STATUS__\d+$/, '').trim();
+
     if (status >= 400) throw new Error(`HTTP ${status} from ${url}`);
     return JSON.parse(text);
 }
 
-// ── Parallel search — raw Node HTTPS (no TLS spoof needed for /api/search) ─
+// ── Parallel search — raw Node HTTPS ─────────────────────────────────────
+// /api/search doesn't need TLS impersonation, so use fast Node native HTTPS
 
 const _agent = new https.Agent({ keepAlive: true, maxSockets: 40, keepAliveMsecs: 30000 });
 
@@ -162,14 +180,11 @@ async function decompressBody(buf, enc) {
 
 export function parallelSearch(query, limit, types) {
     const cfCookies = getCFCookies();
-    const headers = {
+    const baseHeaders = {
         'accept': 'application/json, */*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
         'accept-encoding': 'gzip, deflate, br',
         'user-agent': UA,
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
         'referer': 'https://nanoreview.net/',
         ...(cfCookies ? { cookie: cfCookies } : {}),
     };
@@ -180,7 +195,7 @@ export function parallelSearch(query, limit, types) {
             hostname: 'nanoreview.net',
             path,
             method: 'GET',
-            headers: { ...headers, host: 'nanoreview.net' },
+            headers: { ...baseHeaders, host: 'nanoreview.net' },
             agent: _agent,
             timeout: 4000,
         }, res => {
@@ -206,23 +221,19 @@ export function parallelSearch(query, limit, types) {
     }))).then(arrays => arrays.flat());
 }
 
-// ── Lifecycle ─────────────────────────────────────────────────────────────
+// ── Warmup ────────────────────────────────────────────────────────────────
 
 export async function warmupTLS() {
-    console.log('[tls] Warming up (establishing CF clearance)...');
+    console.log('[curl] Warming up (establishing CF clearance)...');
     const t = Date.now();
     try {
-        await fetchHtml('https://nanoreview.net/en/', { timeout: 15000 });
-        console.log(`[tls] Warm-up done in ${Date.now() - t}ms. CF cookies: ${!!getCFCookies()}`);
+        await fetchHtml('https://nanoreview.net/en/', { timeout: 15 });
+        console.log(`[curl] Warm-up done in ${Date.now() - t}ms. CF cookies: ${!!getCFCookies()}`);
     } catch (err) {
-        console.warn('[tls] Warm-up error (will retry on first request):', err.message);
+        console.warn('[curl] Warm-up error:', err.message);
     }
 }
 
 export async function destroyTLS() {
-    try {
-        if (_session) await _session.close();
-        await _destroyTLS();
-    } catch {}
-    _session = null;
+    // No-op for curl approach — no persistent connections to clean up
 }
