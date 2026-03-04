@@ -1,19 +1,27 @@
 /**
- * nextjs.js - Next.js /_next/data/ JSON API
+ * nextjs.js — Next.js data extraction layer
  *
- * nanoreview is Next.js. Their device pages expose pure JSON at:
- *   /_next/data/{buildId}/en/{type}/{slug}.json
+ * nanoreview.net is a Next.js SSR app. Every device page embeds the FULL
+ * device data as JSON in a <script id="__NEXT_DATA__"> tag — so we never
+ * need to parse HTML with cheerio for device details.
  *
- * This returns structured device data with no HTML parsing needed.
- * buildId is discovered once from homepage and cached in memory.
+ * TWO strategies, tried in order:
+ *
+ * 1. /_next/data/{buildId}/en/{type}/{slug}.json  — pure JSON API, no HTML
+ *    parsing, fastest (~100-200ms). buildId cached 2h.
+ *
+ * 2. Full page HTML + extract __NEXT_DATA__  — fallback if buildId is stale.
+ *    Still zero-DOM, just regex on the raw HTML (~200-400ms).
  */
-import { directFetchHtml } from './http.js';
+import { fetchHtml, fetchJson, getCFCookies } from './tls.js';
 import { cache, TTL } from './cache.js';
 
 let _buildId = null;
 let _buildIdExpiry = 0;
 
-async function fetchBuildId(cookies = '') {
+// ── buildId discovery ─────────────────────────────────────────────────────
+
+async function getBuildId() {
     if (_buildId && Date.now() < _buildIdExpiry) return _buildId;
 
     const cached = cache.get('meta', 'buildId');
@@ -24,7 +32,10 @@ async function fetchBuildId(cookies = '') {
     }
 
     try {
-        const html = await directFetchHtml('https://nanoreview.net/en/', cookies, 6000);
+        const html = await fetchHtml('https://nanoreview.net/en/', {
+            cookies: getCFCookies(),
+            timeout: 8000,
+        });
         const m = html.match(/"buildId"\s*:\s*"([^"]+)"/);
         if (m) {
             _buildId = m[1];
@@ -34,48 +45,200 @@ async function fetchBuildId(cookies = '') {
             return _buildId;
         }
     } catch (err) {
-        console.log('[nextjs] buildId fetch failed:', err.message);
+        console.warn('[nextjs] buildId fetch failed:', err.message);
     }
     return null;
 }
 
-export async function fetchNextData(contentType, slug, cookies = '') {
-    const buildId = await fetchBuildId(cookies);
-    if (!buildId) return null;
+export function invalidateBuildId() {
+    _buildId = null;
+    _buildIdExpiry = 0;
+    cache.del('meta', 'buildId');
+}
 
-    const url = `https://nanoreview.net/_next/data/${buildId}/en/${contentType}/${slug}.json`;
-    const cacheKey = `next:${contentType}:${slug}`;
-    const cached = cache.get('device', cacheKey);
-    if (cached) return cached;
+// ── __NEXT_DATA__ parser ──────────────────────────────────────────────────
+
+function parseNextData(html, sourceUrl) {
+    if (!html) return null;
+
+    // Extract JSON from <script id="__NEXT_DATA__">
+    const m = html.match(/<script\s+id="__NEXT_DATA__"\s+type="application\/json">([^<]+)<\/script>/);
+    if (!m) return null;
 
     try {
-        const text = await directFetchHtml(url, cookies, 5000);
-        if (!text || text.trim()[0] !== '{') return null;
-        const json = JSON.parse(text);
-        const props = json?.pageProps;
+        const next = JSON.parse(m[1]);
+        const props = next?.props?.pageProps;
         if (!props) return null;
-        const d = props?.device || props?.phone || props?.item || props?.data || props?.pageData;
+
+        // Device data can be under various keys depending on content type
+        const d = props?.device || props?.phone || props?.laptop ||
+                  props?.cpu || props?.gpu || props?.soc || props?.tablet ||
+                  props?.item || props?.data || props?.pageData;
         if (!d?.name) return null;
 
-        const result = {
-            title: d.name,
-            sourceUrl: `https://nanoreview.net/en/${contentType}/${slug}`,
-            images: d.image ? [d.image] : (d.images || []),
-            scores: d.scores || d.ratings || {},
-            pros: d.pros || d.advantages || [],
-            cons: d.cons || d.disadvantages || [],
-            specs: d.specs || d.specifications || d.params || {},
-            _source: 'next_api',
-        };
-
-        cache.set('device', cacheKey, result, TTL.device);
-        console.log('[nextjs] hit:', slug);
-        return result;
+        return normalizeDeviceData(d, sourceUrl);
     } catch {
         return null;
     }
 }
 
-export async function prefetchBuildId(cookies = '') {
-    await fetchBuildId(cookies).catch(() => {});
+function normalizeDeviceData(d, sourceUrl) {
+    // Flatten specs — nanoreview stores them in various structures
+    const specs = {};
+
+    if (d.specs && typeof d.specs === 'object') {
+        if (Array.isArray(d.specs)) {
+            // Array of {title, items: [{name, value}]}
+            for (const group of d.specs) {
+                if (group.title && Array.isArray(group.items)) {
+                    const section = {};
+                    for (const item of group.items) {
+                        if (item.name && item.value != null) {
+                            section[item.name] = String(item.value);
+                        }
+                    }
+                    if (Object.keys(section).length) specs[group.title] = section;
+                } else if (group.name && group.value != null) {
+                    specs['Specs'] = specs['Specs'] || {};
+                    specs['Specs'][group.name] = String(group.value);
+                }
+            }
+        } else {
+            Object.assign(specs, d.specs);
+        }
+    }
+
+    // Also flatten params (common in nanoreview)
+    if (d.params && typeof d.params === 'object') {
+        if (Array.isArray(d.params)) {
+            for (const group of d.params) {
+                if (group.name && Array.isArray(group.params)) {
+                    const section = {};
+                    for (const p of group.params) {
+                        if (p.name && p.value != null) {
+                            section[p.name] = String(p.value);
+                        }
+                    }
+                    if (Object.keys(section).length) specs[group.name] = section;
+                }
+            }
+        } else {
+            Object.assign(specs, d.params);
+        }
+    }
+
+    // Scores
+    const scores = {};
+    if (d.scores && typeof d.scores === 'object') {
+        if (Array.isArray(d.scores)) {
+            for (const s of d.scores) {
+                if (s.name && s.value != null) scores[s.name] = String(s.value);
+            }
+        } else {
+            Object.assign(scores, d.scores);
+        }
+    }
+    // Also grab top-level numeric score fields
+    for (const key of ['total_score', 'score', 'rating', 'nanoreview_score']) {
+        if (d[key] != null) scores[key] = String(d[key]);
+    }
+
+    // Pros/cons
+    const pros = Array.isArray(d.pros) ? d.pros.map(p => (typeof p === 'string' ? p : p.text || p.name || '')) : [];
+    const cons = Array.isArray(d.cons) ? d.cons.map(c => (typeof c === 'string' ? c : c.text || c.name || '')) : [];
+
+    // Advantages/disadvantages (alternate naming)
+    const advantages = Array.isArray(d.advantages)
+        ? d.advantages.map(p => typeof p === 'string' ? p : p.text || p.name || '')
+        : [];
+    const disadvantages = Array.isArray(d.disadvantages)
+        ? d.disadvantages.map(c => typeof c === 'string' ? c : c.text || c.name || '')
+        : [];
+
+    // Images
+    const images = [];
+    if (d.image) images.push(d.image);
+    if (d.image_url) images.push(d.image_url);
+    if (Array.isArray(d.images)) images.push(...d.images);
+
+    return {
+        title: d.name || d.title || '',
+        sourceUrl,
+        images: [...new Set(images.filter(Boolean))],
+        scores,
+        pros: [...new Set([...pros, ...advantages].filter(Boolean))],
+        cons: [...new Set([...cons, ...disadvantages].filter(Boolean))],
+        specs,
+        _source: 'next_data',
+    };
+}
+
+// ── Main export ───────────────────────────────────────────────────────────
+
+/**
+ * fetchDeviceData — returns structured device data for a given type+slug.
+ *
+ * Strategy:
+ * 1. Memory/disk cache → <1ms
+ * 2. /_next/data/ JSON API → ~100-200ms (fastest, no HTML)
+ * 3. Full page HTML + __NEXT_DATA__ extraction → ~200-500ms
+ */
+export async function fetchDeviceData(contentType, slug, sourceUrl) {
+    const cacheKey = `device:${contentType}:${slug}`;
+    const cached = cache.get('device', cacheKey);
+    if (cached) {
+        console.log(`[nextjs] cache hit: ${slug}`);
+        return cached;
+    }
+
+    const cookies = getCFCookies();
+
+    // ── Strategy 1: /_next/data/ JSON endpoint (no HTML parsing)
+    const buildId = await getBuildId();
+    if (buildId) {
+        const jsonUrl = `https://nanoreview.net/_next/data/${buildId}/en/${contentType}/${slug}.json`;
+        try {
+            const json = await fetchJson(jsonUrl, { cookies, timeout: 5000 });
+            const props = json?.pageProps;
+            const d = props?.device || props?.phone || props?.laptop ||
+                      props?.cpu || props?.gpu || props?.soc || props?.tablet ||
+                      props?.item || props?.data;
+
+            if (d?.name) {
+                const result = normalizeDeviceData(d, sourceUrl);
+                cache.set('device', cacheKey, result, TTL.device);
+                console.log(`[nextjs] /_next/data hit: ${slug}`);
+                return result;
+            }
+        } catch (err) {
+            // buildId may be stale — invalidate and fall through
+            if (err.message?.includes('404') || err.message?.includes('HTTP 404')) {
+                console.log('[nextjs] buildId stale, invalidating...');
+                invalidateBuildId();
+            } else {
+                console.warn(`[nextjs] JSON API failed for ${slug}:`, err.message);
+            }
+        }
+    }
+
+    // ── Strategy 2: Full page HTML + __NEXT_DATA__ extraction
+    try {
+        const html = await fetchHtml(sourceUrl, { cookies, timeout: 8000 });
+        const result = parseNextData(html, sourceUrl);
+        if (result?.title) {
+            cache.set('device', cacheKey, result, TTL.device);
+            console.log(`[nextjs] __NEXT_DATA__ extracted: ${slug}`);
+            return result;
+        }
+        console.warn(`[nextjs] No device data in HTML for ${slug}`);
+    } catch (err) {
+        console.warn(`[nextjs] HTML fetch failed for ${slug}:`, err.message);
+    }
+
+    return null;
+}
+
+/** Pre-warm the buildId (call on startup) */
+export async function prefetchBuildId() {
+    await getBuildId().catch(() => {});
 }

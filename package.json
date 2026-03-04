@@ -1,16 +1,21 @@
 {
   "name": "nanoreview-api",
-  "version": "3.0.0",
+  "version": "4.0.0",
+  "description": "NanoReview unofficial API — zero-browser, TLS-impersonation, sub-second responses",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.0",
     "cheerio": "^1.2.0",
     "dotenv": "^17.3.1",
     "fastify": "^5.7.3",
-    "playwright": "^1.58.2"
+    "node-tls-client": "^1.0.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
