@@ -1,229 +1,140 @@
-/**
- * browser.js — Browser pool with CF session management
- *
- * Strategy:
- * 1. On startup: open ONE page, load nanoreview.net, solve CF challenge, store cookies
- * 2. All subsequent requests: use a persistent page that stays open at nanoreview.net
- *    and makes fetch() calls from inside it — no new navigations
- * 3. If CF challenge appears again: re-solve on the persistent page
- */
-import { chromium } from 'playwright-core';
+import chromium from '@sparticuz/chromium';
+import { chromium as playwrightCore } from 'playwright-core';
+import { chromium as playwrightLocal } from 'playwright';
 
-let _browser = null;
-let _context = null;
-let _activePage = null;      // persistent page kept alive at nanoreview.net
-let _pageReady = false;      // true = page is at nanoreview.net and past CF
-let _initPromise = null;     // deduplicate concurrent init calls
+export const getBrowserContext = async () => {
+    const isVercel = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
+    let browser;
 
-const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/chromium';
-const BASE_URL = 'https://nanoreview.net/en/';
-
-// ── Launch ────────────────────────────────────────────────────────────────
-
-async function launch() {
-    console.log('[browser] Launching Chromium...');
-    const browser = await chromium.launch({
-        executablePath: CHROMIUM_PATH,
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-blink-features=AutomationControlled',
-            '--no-zygote',
-            '--single-process',
-        ],
-        timeout: 30000,
-    });
+    if (isVercel) {
+        // Vercel environment - use playwright-core with chromium
+        const executablePath = await chromium.executablePath();
+        browser = await playwrightCore.launch({
+            args: [
+                ...chromium.args,
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-dev-shm-usage',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+            ],
+            executablePath: executablePath || undefined,
+            headless: chromium.headless !== false ? true : chromium.headless,
+            timeout: 30000,
+        });
+    } else {
+        // Local environment
+        browser = await playwrightLocal.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+            ],
+            timeout: 30000,
+        });
+    }
 
     const context = await browser.newContext({
         viewport: { width: 1280, height: 720 },
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         locale: 'en-US',
         timezoneId: 'America/New_York',
-        extraHTTPHeaders: { 'accept-language': 'en-US,en;q=0.9' },
+        extraHTTPHeaders: {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        },
+        // Increase timeout for slow responses
+        timeout: 30000,
     });
 
+    // Add stealth-like behavior without the plugin
     await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        window.chrome = { runtime: {} };
+        // Override the navigator.webdriver property
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+        });
+
+        // Override the navigator.plugins to appear more real
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+        });
+
+        // Override chrome property
+        window.chrome = {
+            runtime: {},
+        };
+
+        // Override permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
     });
 
-    browser.on('disconnected', () => {
-        console.warn('[browser] Disconnected, resetting state');
-        _browser = null; _context = null; _activePage = null; _pageReady = false; _initPromise = null;
-    });
+    return { browser, context };
+};
 
-    console.log('[browser] Chromium ready ✅');
-    _browser = browser;
-    _context = context;
-    return context;
-}
+export const waitForCloudflare = async (page, selector, timeout = 20000) => {
+    const start = Date.now();
+    let lastError;
 
-// ── CF challenge waiter ───────────────────────────────────────────────────
-
-async function waitForCF(page, timeoutMs = 20000) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-        const title = await page.title().catch(() => '');
-        const url = page.url();
-        if (
-            !/just a moment|attention required|checking your browser/i.test(title) &&
-            !/cdn-cgi\/challenge/i.test(url)
-        ) return true;
-        console.log('[browser] Waiting for CF challenge...');
-        await page.waitForTimeout(1500);
-    }
-    return false; // timed out but continue anyway
-}
-
-// ── Persistent active page ────────────────────────────────────────────────
-// This page stays open at nanoreview.net. All fetch() calls go through it.
-
-async function ensureActivePage() {
-    // Already ready
-    if (_activePage && _pageReady) return _activePage;
-
-    // Deduplicate concurrent calls
-    if (_initPromise) return _initPromise;
-
-    _initPromise = (async () => {
+    while (Date.now() - start < timeout) {
         try {
-            const ctx = _context || await launch();
+            // Check if we're past Cloudflare
+            const title = await page.title().catch(() => '');
+            const url = await page.url().catch(() => '');
 
-            if (!_activePage || _activePage.isClosed()) {
-                _activePage = await ctx.newPage();
+            const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
+            const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
 
-                // Block heavy resources on this page too
-                await _activePage.route('**/*', route => {
-                    const t = route.request().resourceType();
-                    if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
-                    else route.continue();
-                });
+            if (!isChallenge && !isChallengeUrl) {
+                // Try to find the selector or just return if page seems loaded
+                try {
+                    await page.waitForSelector(selector, { timeout: 2000, state: 'attached' });
+                    return true;
+                } catch {
+                    // Check if page at least has content
+                    const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
+                    if (hasContent) return true;
+                }
             }
 
-            console.log('[browser] Navigating to nanoreview.net...');
-            await _activePage.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await waitForCF(_activePage);
-
-            _pageReady = true;
-            console.log('[browser] Active page ready at nanoreview.net ✅');
-            return _activePage;
-        } finally {
-            _initPromise = null;
+            await page.waitForTimeout(1000);
+        } catch (error) {
+            lastError = error;
+            await page.waitForTimeout(1000);
         }
-    })();
+    }
 
-    return _initPromise;
-}
+    // One final check before failing
+    try {
+        const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
+        if (hasContent) return true;
+    } catch {}
 
-// ── Public API ────────────────────────────────────────────────────────────
+    throw new Error(`Cloudflare timeout after ${timeout}ms: ${lastError?.message || 'Unknown error'}`);
+};
 
-/**
- * runFetch — execute a fetch() from inside the persistent browser page.
- * Fast: no navigation, inherits CF cookies, reuses existing session.
- */
-export async function runFetch(url, { isJson = true } = {}) {
-    const page = await ensureActivePage();
+export const safeNavigate = async (page, url, options = {}) => {
+    const defaultOptions = {
+        waitUntil: 'domcontentloaded',
+        timeout: 25000,
+    };
 
-    const result = await page.evaluate(async ({ url, isJson }) => {
+    try {
+        await page.goto(url, { ...defaultOptions, ...options });
+        return true;
+    } catch (error) {
+        // If navigation times out but we have content, that's okay
         try {
-            const res = await fetch(url, {
-                headers: { accept: isJson ? 'application/json' : 'text/html,*/*' },
-                signal: AbortSignal.timeout(10000),
-            });
-            if (!res.ok) return { error: res.status, status: res.status };
-            const text = await res.text();
-            return { text, status: res.status };
-        } catch (e) { return { error: String(e) }; }
-    }, { url, isJson });
-
-    if (result.error) {
-        // If CF kicked us out, reset page readiness and retry once
-        if (result.status === 403 || result.status === 503) {
-            console.warn('[browser] CF blocked fetch, re-warming page...');
-            _pageReady = false;
-            const page2 = await ensureActivePage();
-            const retry = await page2.evaluate(async ({ url, isJson }) => {
-                try {
-                    const res = await fetch(url, {
-                        headers: { accept: isJson ? 'application/json' : 'text/html,*/*' },
-                        signal: AbortSignal.timeout(10000),
-                    });
-                    if (!res.ok) return { error: res.status };
-                    return { text: await res.text(), status: res.status };
-                } catch (e) { return { error: String(e) }; }
-            }, { url, isJson });
-            if (retry.error) throw new Error(`Fetch failed after retry: ${retry.error}`);
-            return retry.text;
-        }
-        throw new Error(`Fetch error for ${url}: ${result.error}`);
+            const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
+            if (hasContent) return true;
+        } catch {}
+        throw error;
     }
-
-    return result.text;
-}
-
-/**
- * parallelSearchInBrowser — fire all type searches simultaneously from inside browser.
- */
-export async function parallelSearchInBrowser(query, limit, types) {
-    const page = await ensureActivePage();
-
-    const results = await page.evaluate(async ({ query, limit, types }) => {
-        const all = await Promise.all(types.map(async type => {
-            try {
-                const res = await fetch(
-                    `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`,
-                    { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(7000) }
-                );
-                if (!res.ok) return [];
-                const data = await res.json();
-                return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
-            } catch { return []; }
-        }));
-        return all.flat();
-    }, { query, limit, types });
-
-    return results;
-}
-
-/**
- * fetchPageHtml — navigate a TEMPORARY page and get HTML.
- * Used only for device pages (not search). Separate from active page.
- */
-export async function fetchPageHtml(url) {
-    // Ensure we have a context (may trigger launch if first call)
-    if (!_context) await ensureActivePage();
-
-    const page = await _context.newPage();
-    try {
-        await page.route('**/*', route => {
-            const t = route.request().resourceType();
-            if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
-            else route.continue();
-        });
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-        await waitForCF(page, 15000);
-        return await page.content();
-    } finally {
-        await page.close().catch(() => {});
-    }
-}
-
-export async function warmupBrowser() {
-    console.log('[browser] Warming up (establishing CF session)...');
-    const t = Date.now();
-    try {
-        await ensureActivePage();
-        console.log(`[browser] Warm-up done in ${Date.now() - t}ms ✅`);
-    } catch (err) {
-        console.warn('[browser] Warm-up failed:', err.message);
-    }
-}
-
-export async function destroyBrowser() {
-    if (_browser) { await _browser.close().catch(() => {}); }
-    _browser = null; _context = null; _activePage = null; _pageReady = false;
-}
+};
