@@ -2,21 +2,18 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Install curl-impersonate (lexiforest fork v1.2.2 — active fork with musl builds)
-# Downloaded at BUILD TIME — zero runtime downloads at deploy time.
-RUN apk add --no-cache ca-certificates wget tar && \
+# curl-impersonate needs bash (scripts use #!/usr/bin/env bash)
+# Install at BUILD TIME — binaries are shell scripts wrapping curl with preset flags
+RUN apk add --no-cache ca-certificates wget tar bash && \
     ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then ARCH_TAG="x86_64-linux-musl"; \
-    elif [ "$ARCH" = "aarch64" ]; then ARCH_TAG="aarch64-linux-musl"; \
-    else echo "Unsupported arch: $ARCH" && exit 1; fi && \
-    wget -q "https://github.com/lexiforest/curl-impersonate/releases/download/v1.2.2/curl-impersonate-v1.2.2.${ARCH_TAG}.tar.gz" \
+    if [ "$ARCH" = "x86_64" ]; then TAG="x86_64-linux-musl"; \
+    else TAG="aarch64-linux-musl"; fi && \
+    wget -q "https://github.com/lexiforest/curl-impersonate/releases/download/v1.2.2/curl-impersonate-v1.2.2.${TAG}.tar.gz" \
          -O /tmp/ci.tar.gz && \
-    mkdir -p /tmp/ci && \
-    tar -xzf /tmp/ci.tar.gz -C /tmp/ci && \
-    echo "--- extracted files ---" && ls /tmp/ci/ && \
-    find /tmp/ci -type f -name "curl*" -exec install -m755 {} /usr/local/bin/curl_chrome131 \; && \
-    rm -rf /tmp/ci /tmp/ci.tar.gz && \
-    curl_chrome131 --version
+    tar -xzf /tmp/ci.tar.gz -C /usr/local/bin && \
+    rm /tmp/ci.tar.gz && \
+    chmod +x /usr/local/bin/curl_chrome131 && \
+    curl_chrome131 --version && echo "curl-impersonate OK"
 
 COPY package*.json ./
 RUN npm install --omit=dev
