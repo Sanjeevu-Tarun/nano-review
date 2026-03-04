@@ -2,15 +2,12 @@ import 'dotenv/config';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { setupRoutes } from './routes.js';
-import { warmupTLS, getCFCookies } from './tls.js';
+import { warmupTLS, getCFCookies, fetchHtml, destroyTLS } from './tls.js';
 import { prefetchBuildId } from './nextjs.js';
 
 const fastify = Fastify({
     logger: {
         level: process.env.LOG_LEVEL || 'info',
-        transport: process.env.NODE_ENV !== 'production'
-            ? { target: 'pino-pretty', options: { colorize: true } }
-            : undefined,
     },
 });
 
@@ -23,25 +20,21 @@ setupRoutes(fastify);
 
 const port = parseInt(process.env.PORT || '3000', 10);
 await fastify.listen({ port, host: '0.0.0.0' });
-console.log(`\n🚀 NanoReview API v4 (zero-browser) live on port ${port}`);
-console.log('   No Playwright, no Chromium — pure TLS impersonation\n');
+console.log(`\n🚀 NanoReview API v4 (zero-browser, TLS-impersonation) on port ${port}\n`);
 
-// Warm up TLS session + pre-fetch buildId in background
-// First real request will also trigger this if not done yet, but
-// pre-warming means users get sub-100ms cache responses immediately.
+// Background: warm TLS session + pre-fetch buildId
+// This happens once on startup. First request will block on warmupTLS if not done.
 warmupTLS()
     .then(async () => {
         await prefetchBuildId();
-        console.log('[startup] TLS session warm + buildId ready ✅');
+        console.log('[startup] TLS warm + buildId ready ✅');
     })
     .catch(err => console.warn('[startup] Warm-up error:', err.message));
 
-// Refresh CF cookies every 20 min (they last 30 min)
+// Refresh CF cookies every 20 min (CF clearance expires at 30 min)
 setInterval(async () => {
-    const cookies = getCFCookies();
-    if (!cookies) return; // not yet obtained, skip
+    if (!getCFCookies()) return;
     try {
-        const { fetchHtml } = await import('./tls.js');
         await fetchHtml('https://nanoreview.net/en/', { timeout: 8000 });
         console.log('[keepalive] CF cookies refreshed');
     } catch (err) {
@@ -49,5 +42,10 @@ setInterval(async () => {
     }
 }, 20 * 60 * 1000).unref();
 
-// NOTE: Prevent Render free-tier sleep → use UptimeRobot (free)
-// Monitor: https://your-app.onrender.com/health every 5 min
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+    await destroyTLS();
+    process.exit(0);
+});
+
+// NOTE: Prevent Render free-tier sleep → UptimeRobot pinging /health every 5 min

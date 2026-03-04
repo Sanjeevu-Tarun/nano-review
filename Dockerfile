@@ -1,9 +1,11 @@
-FROM mcr.microsoft.com/playwright:v1.58.2-jammy
+FROM node:22-slim
 
 WORKDIR /app
+
+# tlsclientwrapper uses koffi (FFI to Go shared lib) — no extra system deps needed
 COPY package*.json ./
-RUN npm install
-# No need to install chromium separately - it's in the base image
+RUN npm install --omit=dev
+
 COPY . .
 
 EXPOSE 3000
