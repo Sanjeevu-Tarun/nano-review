@@ -2,16 +2,12 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { setupRoutes } from '../routes.js';
 
-const fastify = Fastify({ logger: false });
-
-fastify.register(cors, {
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-});
-
-setupRoutes(fastify);
+// Build the app once, reuse across invocations
+const app = Fastify({ logger: false });
+await app.register(cors, { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] });
+setupRoutes(app);
+await app.ready();
 
 export default async function handler(req, res) {
-    await fastify.ready();
-    fastify.server.emit('request', req, res);
+    app.server.emit('request', req, res);
 }

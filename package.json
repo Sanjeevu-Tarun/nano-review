@@ -3,15 +3,13 @@
   "version": "2.0.0",
   "type": "module",
   "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@fastify/cors": "^10.0.0",
     "cheerio": "^1.2.0",
     "fastify": "^5.7.3"
-  },
-  "optionalDependencies": {
-    "@sparticuz/chromium": "^133.0.0",
-    "playwright": "^1.50.0",
-    "playwright-core": "^1.50.0"
   },
   "scripts": {
     "start": "node server.js"

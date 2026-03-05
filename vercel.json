@@ -1,9 +1,8 @@
 {
   "version": 2,
   "functions": {
-    "api/**/*.js": {
-      "maxDuration": 60,
-      "memory": 2048
+    "api/server.js": {
+      "maxDuration": 30
     }
   },
   "rewrites": [
