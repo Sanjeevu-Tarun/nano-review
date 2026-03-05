@@ -1,17 +1,17 @@
 import * as cheerio from 'cheerio';
-import { waitForCloudflare, safeNavigate } from './browser.js';
+import { waitForCloudflare, safeNavigate, reWarmCloudflare } from './browser.js';
 
 // ─── Caches ───────────────────────────────────────────────────────────────────
-const searchCache = new Map();  // query → { results, timestamp }
-const pageCache   = new Map();  // url   → { data, timestamp }
-const SEARCH_TTL  = 5  * 60 * 1000;  // 5 min
-const PAGE_TTL    = 10 * 60 * 1000;  // 10 min
+const searchCache = new Map();
+const pageCache   = new Map();
+const SEARCH_TTL  = 5  * 60 * 1000;
+const PAGE_TTL    = 10 * 60 * 1000;
 
 function evict(cache, maxSize = 100) {
     if (cache.size > maxSize) cache.delete(cache.keys().next().value);
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Type detection ───────────────────────────────────────────────────────────
 const detectLikelyTypes = (query) => {
     const q = query.toLowerCase();
     if (/ryzen|intel|core|threadripper|xeon|celeron|pentium|i[3579]-|amd|snapdragon|mediatek|exynos|dimensity|a[0-9]{2}\s*bionic/i.test(q))
@@ -28,8 +28,7 @@ const detectLikelyTypes = (query) => {
 };
 
 const scoreMatch = (name, q) => {
-    const n = name.toLowerCase();
-    const ql = q.toLowerCase();
+    const n = name.toLowerCase(), ql = q.toLowerCase();
     if (n === ql) return 1000;
     if (n.includes(ql)) return 500;
     let score = 0;
@@ -37,23 +36,19 @@ const scoreMatch = (name, q) => {
     return score - n.length * 0.1;
 };
 
+// ─── Image extraction ─────────────────────────────────────────────────────────
 function extractImages($) {
     const images = new Set();
     $('img').each((_, img) => {
-        const attrs = ['data-src', 'src', 'srcset', 'data-srcset'];
-        for (const attr of attrs) {
+        for (const attr of ['data-src', 'src', 'srcset', 'data-srcset']) {
             const val = $(img).attr(attr);
             if (!val) continue;
-            for (const part of val.split(',')) {
-                const src = part.trim().split(' ')[0];
-                if (src) pushSrc(src, images);
-            }
+            for (const part of val.split(',')) pushSrc(part.trim().split(' ')[0], images);
         }
         $(img).closest('picture').find('source').each((_, s) => {
             for (const attr of ['srcset', 'data-srcset']) {
                 const val = $(s).attr(attr);
-                if (!val) continue;
-                for (const part of val.split(',')) pushSrc(part.trim().split(' ')[0], images);
+                if (val) for (const part of val.split(',')) pushSrc(part.trim().split(' ')[0], images);
             }
         });
     });
@@ -68,9 +63,21 @@ function pushSrc(src, set) {
         set.add(src);
 }
 
-// ─── Search — uses direct HTTP fetch, NO browser navigation needed ────────────
-// The NanoReview search API is a plain JSON endpoint; opening the homepage first
-// was the single biggest slowdown in the original code.
+// ─── Cloudflare detection ─────────────────────────────────────────────────────
+function isCloudflareBlock(html, title) {
+    const lcTitle = (title || '').toLowerCase();
+    const lcHtml  = (html   || '').toLowerCase();
+    return (
+        lcTitle.includes('just a moment') ||
+        lcTitle.includes('attention required') ||
+        lcTitle === 'nanoreview.net' ||           // CF default — no real content
+        lcHtml.includes('cf-browser-verification') ||
+        lcHtml.includes('challenge-form') ||
+        lcHtml.includes('cloudflare') && lcHtml.includes('ray id')
+    );
+}
+
+// ─── Search — direct HTTP fetch, no browser needed ────────────────────────────
 export const searchDevices = async (context, query, limit = 5) => {
     const cacheKey = `${query.toLowerCase()}-${limit}`;
     const cached = searchCache.get(cacheKey);
@@ -78,16 +85,16 @@ export const searchDevices = async (context, query, limit = 5) => {
 
     const types = detectLikelyTypes(query);
 
-    // Fire all type-searches in parallel directly from Node (no browser page needed)
     const fetchType = async (type) => {
         try {
             const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
             const res = await fetch(url, {
                 headers: {
                     'Accept': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    'Referer': 'https://nanoreview.net/',
                 },
-                signal: AbortSignal.timeout(4000),
+                signal: AbortSignal.timeout(5000),
             });
             if (!res.ok) return [];
             const data = await res.json();
@@ -98,43 +105,80 @@ export const searchDevices = async (context, query, limit = 5) => {
     };
 
     const allResults = (await Promise.all(types.map(fetchType))).flat();
-    if (allResults.length === 0) return [];
+    if (!allResults.length) return [];
 
     allResults.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
 
     searchCache.set(cacheKey, { results: allResults, timestamp: Date.now() });
     evict(searchCache);
-
     return allResults;
 };
 
-// ─── Shared page scraper core ─────────────────────────────────────────────────
+// ─── Shared page scraper — with CF bypass logic ───────────────────────────────
 async function scrapePage(context, url, parseHtml) {
     const cached = pageCache.get(url);
     if (cached && Date.now() - cached.timestamp < PAGE_TTL) return cached.data;
 
     const page = await context.newPage();
     try {
-        // Block heaviest resource types
+        // Only block fonts/media — keep CSS & JS so Cloudflare challenges can execute
         await page.route('**/*', (route) => {
             const t = route.request().resourceType();
-            if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
+            if (['font', 'media', 'image'].includes(t)) route.abort();
             else route.continue();
         });
 
-        await safeNavigate(page, url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await safeNavigate(page, url, { waitUntil: 'domcontentloaded', timeout: 25000 });
 
-        // Replace fixed 1000ms wait with a smart content-ready check
-        await Promise.race([
-            page.waitForSelector('h1', { timeout: 5000 }).catch(() => {}),
-            page.waitForTimeout(3000),
-        ]);
+        // Wait for CF challenge to resolve OR real content to appear
+        // Real content on NanoReview has .specs-table or .device-specs or h1 with device name
+        let html = '';
+        let resolved = false;
 
-        const html = await page.content();
+        for (let attempt = 0; attempt < 6; attempt++) {
+            html = await page.content();
+            const title = await page.title().catch(() => '');
+
+            if (!isCloudflareBlock(html, title)) {
+                // Check if h1 has actual device content (not just site title)
+                const h1 = await page.$eval('h1', el => el.textContent.trim()).catch(() => '');
+                if (h1 && h1.toLowerCase() !== 'nanoreview' && h1.length > 3) {
+                    resolved = true;
+                    break;
+                }
+                // Page might still be loading JS-rendered content — wait a bit
+                if (attempt < 3) {
+                    await page.waitForTimeout(1500);
+                    continue;
+                }
+                resolved = true; // Accept it as-is after retries
+                break;
+            }
+
+            // Still on CF challenge — wait for it to auto-solve
+            await page.waitForTimeout(2000);
+        }
+
+        if (!resolved) {
+            // Re-warm CF session (re-visit homepage to get fresh cookies) then retry once
+            await reWarmCloudflare();
+            await safeNavigate(page, url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            await page.waitForTimeout(3000);
+            html = await page.content();
+            const title = await page.title().catch(() => '');
+            if (isCloudflareBlock(html, title)) {
+                throw new Error('Cloudflare is blocking this request. The server IP may need to be whitelisted or try again in a moment.');
+            }
+        }
+
+        html = await page.content();
         const data = parseHtml(html, url);
 
-        pageCache.set(url, { data, timestamp: Date.now() });
-        evict(pageCache);
+        // Only cache if we got real data (avoid caching CF walls)
+        if (data.title && data.title.toLowerCase() !== 'nanoreview.net') {
+            pageCache.set(url, { data, timestamp: Date.now() });
+            evict(pageCache);
+        }
 
         return data;
     } finally {
