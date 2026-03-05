@@ -19,46 +19,55 @@ export function setupRoutes(fastify) {
         const { q = 'iphone 15' } = req.query;
         const results = {};
         try {
-            const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(q)}&limit=2&type=phone`;
-            const res = await fetch(url, {
+            // Search
+            const searchRes = await fetch(`https://nanoreview.net/api/search?q=${encodeURIComponent(q)}&limit=2&type=phone`, {
                 headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'application/json' },
                 signal: AbortSignal.timeout(8000),
             });
-            const body = await res.text();
-            let slug = null;
+            const searchBody = await searchRes.text();
             let parsedResults = [];
-            try { 
-                parsedResults = JSON.parse(body);
-                const first = parsedResults[0];
-                slug = first?.slug || first?.url_name || first?.name?.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-            } catch {}
-            results.search = { status: res.status, bodyPreview: body.substring(0, 300), generatedSlug: slug, firstResult: parsedResults[0] };
+            try { parsedResults = JSON.parse(searchBody); } catch {}
+            const first = parsedResults[0];
+            const slug = first?.slug || first?.url_name || first?.name?.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+            results.search = { status: searchRes.status, firstResult: first, generatedSlug: slug };
 
-            // Now fetch the actual device page using the real slug
+            // Device page — show raw HTML chunks so we can see the data structure
             if (slug) {
                 const pageRes = await fetch(`https://nanoreview.net/en/phone/${slug}`, {
                     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'text/html' },
                     signal: AbortSignal.timeout(8000),
                 });
-                const pageBody = await pageRes.text();
+                const html = await pageRes.text();
+
+                // Find data-* attributes and class names used
+                const dataAttrs = [...new Set((html.match(/data-[\w-]+="[^"]{1,50}"/g) || []).slice(0, 20))];
+                const classNames = [...new Set((html.match(/class="([^"]+)"/g) || []).slice(0, 30))];
+
+                // Find any JSON-like structures in script tags
+                const inlineJsons = [];
+                const scriptMatches = html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi);
+                for (const m of scriptMatches) {
+                    const content = m[1].trim();
+                    if (content.startsWith('{') || content.startsWith('[')) {
+                        inlineJsons.push(content.substring(0, 200));
+                    }
+                }
+
+                // Show 500 chars from middle of HTML where specs likely are
+                const mid = Math.floor(html.length / 2);
                 results.devicePage = {
                     status: pageRes.status,
-                    length: pageBody.length,
-                    hasNuxt: pageBody.includes('__NUXT__'),
-                    hasNextData: pageBody.includes('__NEXT_DATA__'),
-                    hasNuxtPayload: pageBody.includes('__NUXT_PAYLOAD__'),
-                    hasNuxtData: pageBody.includes('nuxt-data'),
-                    hasWindowData: pageBody.includes('window.__'),
-                    isCF: pageBody.includes('Just a moment') || pageBody.includes('cf-browser-verification'),
-                    // Show all window.__ assignments
-                    windowVars: (pageBody.match(/window\.__[A-Z_]+/g) || []),
-                    // Show all inline script tags start
-                    scriptPreviews: (pageBody.match(/<script[^>]*>[\s\S]{0,100}/g) || []).slice(0, 5),
-                    preview: pageBody.substring(0, 500),
+                    length: html.length,
+                    isCF: html.includes('Just a moment') || html.includes('cf-browser-verification'),
+                    dataAttrs,
+                    sampleClassNames: classNames.slice(0, 15),
+                    inlineJsons: inlineJsons.slice(0, 3),
+                    htmlStart: html.substring(0, 400),
+                    htmlMid: html.substring(mid, mid + 600),
+                    htmlEnd: html.substring(html.length - 400),
                 };
             }
         } catch (e) { results.error = e.message; }
-
         return reply.send({ success: true, debug: results });
     });
 
