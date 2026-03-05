@@ -1,4 +1,5 @@
-import { searchDevices, fetchDevice, fetchCompare, fetchRankings, pickBest, getSlug } from './scraper.js';
+import { searchDevices, scrapeDevicePage, scrapeComparePage, scrapeRankingPage } from './scraper.js';
+import { getBrowserContext } from './browser.js';
 
 const RANKING_URLS = {
     'desktop-cpu': 'https://nanoreview.net/en/cpu-list/desktop-chips-rating',
@@ -8,82 +9,120 @@ const RANKING_URLS = {
     'laptop-gpu':  'https://nanoreview.net/en/gpu-list/laptop-graphics-rating',
 };
 
+function toDeviceUrl(item) {
+    const slug = item.slug || item.url_name || item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    return `https://nanoreview.net/en/${item.content_type}/${slug}`;
+}
+
 export const setupRoutes = (fastify) => {
 
+    // ── /api/search ──────────────────────────────────────────────────────────
     fastify.get('/api/search', async (req, reply) => {
         const { q, index } = req.query;
-        if (!q?.trim()) return reply.status(400).send({ success: false, error: 'Query "q" is required' });
-        const t0 = Date.now();
+        if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
+
         try {
-            const results = await searchDevices(q.trim(), 10);
-            if (!results.length) return reply.status(404).send({ success: false, error: `No devices found for "${q}"` });
+            // getBrowserContext() returns the SAME browser/context on every call
+            const { context } = await getBrowserContext();
 
-            const item = index !== undefined
-                ? results[Math.min(parseInt(index,10)||0, results.length-1)]
-                : pickBest(results, q.trim());
+            const results = await searchDevices(context, q, 5);
+            if (!results.length) return reply.status(404).send({ success: false, error: 'No devices found' });
 
-            const slug = getSlug(item);
-            const url = `https://nanoreview.net/en/${item.content_type}/${slug}`;
-            const data = await fetchDevice(item.content_type, slug, url);
-            if (!data) return reply.status(404).send({ success: false, error: 'Could not fetch device data' });
+            let item;
+            if (index !== undefined) {
+                const idx = Math.min(parseInt(index, 10) || 0, results.length - 1);
+                item = results[idx];
+            } else {
+                item = results.find(r => r.name.toLowerCase() === q.toLowerCase()) || results[0];
+            }
 
-            data.matchedQuery = q.trim();
-            data.matchedDevice = item.name;
-            data.searchResults = results.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: getSlug(r) }));
-            data._ms = Date.now() - t0;
+            const data = await scrapeDevicePage(context, toDeviceUrl(item));
+            data.matchedQuery = q;
+            data.searchResults = results.map((r, i) => ({
+                index: i,
+                name: r.name,
+                type: r.content_type,
+                slug: r.slug || r.url_name,
+            }));
+
             return reply.send({ success: true, contentType: 'device_details', data });
-        } catch(err) {
-            fastify.log.error(err);
-            return reply.status(500).send({ success: false, error: err.message });
+        } catch (error) {
+            return reply.status(500).send({ success: false, error: error.message });
         }
     });
 
+    // ── /api/compare ─────────────────────────────────────────────────────────
     fastify.get('/api/compare', async (req, reply) => {
         const { q1, q2 } = req.query;
-        if (!q1 || !q2) return reply.status(400).send({ success: false, error: 'Both q1 and q2 required' });
-        const t0 = Date.now();
+        if (!q1 || !q2) return reply.status(400).send({ success: false, error: 'Parameters "q1" and "q2" are required' });
+
         try {
-            const [r1, r2] = await Promise.all([searchDevices(q1.trim(), 5), searchDevices(q2.trim(), 5)]);
-            if (!r1.length || !r2.length) return reply.status(404).send({ success: false, error: `Not found: "${!r1.length ? q1 : q2}"` });
-            const item1 = pickBest(r1, q1), item2 = pickBest(r2, q2);
-            const compareUrl = `https://nanoreview.net/en/${item1.content_type}-compare/${getSlug(item1)}-vs-${getSlug(item2)}`;
-            const data = await fetchCompare(compareUrl);
-            data._ms = Date.now() - t0;
+            const { context } = await getBrowserContext();
+
+            // Search both devices in parallel
+            const [results1, results2] = await Promise.all([
+                searchDevices(context, q1, 3),
+                searchDevices(context, q2, 3),
+            ]);
+
+            if (!results1.length || !results2.length)
+                return reply.status(404).send({ success: false, error: 'One or both devices not found' });
+
+            const item1 = results1.find(r => r.name.toLowerCase() === q1.toLowerCase()) || results1[0];
+            const item2 = results2.find(r => r.name.toLowerCase() === q2.toLowerCase()) || results2[0];
+
+            const slug1 = item1.slug || item1.url_name || item1.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+            const slug2 = item2.slug || item2.url_name || item2.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+            const compareUrl = `https://nanoreview.net/en/${item1.content_type}-compare/${slug1}-vs-${slug2}`;
+
+            const data = await scrapeComparePage(context, compareUrl);
             return reply.send({ success: true, contentType: 'comparison', data });
-        } catch(err) {
-            fastify.log.error(err);
-            return reply.status(500).send({ success: false, error: err.message });
+        } catch (error) {
+            return reply.status(500).send({ success: false, error: error.message });
         }
     });
 
+    // ── /api/suggestions ─────────────────────────────────────────────────────
     fastify.get('/api/suggestions', async (req, reply) => {
         const { q } = req.query;
-        if (!q?.trim()) return reply.status(400).send({ success: false, error: 'Query "q" required' });
-        const t0 = Date.now();
+        if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
+
         try {
-            const results = await searchDevices(q.trim(), 10);
-            return reply.send({
-                success: true, contentType: 'suggestions', _ms: Date.now() - t0,
-                data: results.map((r, i) => ({ index: i, name: r.name, type: r.content_type, slug: getSlug(r), url: `https://nanoreview.net/en/${r.content_type}/${getSlug(r)}` })),
+            const { context } = await getBrowserContext();
+            const results = await searchDevices(context, q, 10);
+
+            const data = results.map((r, i) => {
+                const slug = r.slug || r.url_name || r.name?.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+                return {
+                    index: i,
+                    name: r.name,
+                    type: r.content_type,
+                    slug,
+                    url: `https://nanoreview.net/en/${r.content_type}/${slug}`,
+                    _raw: r,
+                };
             });
-        } catch(err) {
-            return reply.status(500).send({ success: false, error: err.message });
+
+            return reply.send({ success: true, contentType: 'suggestions', data });
+        } catch (error) {
+            return reply.status(500).send({ success: false, error: error.message });
         }
     });
 
+    // ── /api/rankings ────────────────────────────────────────────────────────
     fastify.get('/api/rankings', async (req, reply) => {
         const { type } = req.query;
-        const url = RANKING_URLS[type];
-        if (!url) return reply.status(400).send({ success: false, error: `Invalid type. Valid: ${Object.keys(RANKING_URLS).join(', ')}` });
-        const t0 = Date.now();
+        if (!type) return reply.status(400).send({ success: false, error: 'Query parameter "type" is required' });
+
+        const targetUrl = RANKING_URLS[type];
+        if (!targetUrl) return reply.status(400).send({ success: false, error: 'Invalid type' });
+
         try {
-            const data = await fetchRankings(url);
-            data._ms = Date.now() - t0;
+            const { context } = await getBrowserContext();
+            const data = await scrapeRankingPage(context, targetUrl);
             return reply.send({ success: true, contentType: 'rankings', data });
-        } catch(err) {
-            return reply.status(500).send({ success: false, error: err.message });
+        } catch (error) {
+            return reply.status(500).send({ success: false, error: error.message });
         }
     });
-
-    fastify.get('/health', async (_, reply) => reply.send({ status: 'ok', version: '3.0.0' }));
 };
