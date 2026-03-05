@@ -63,7 +63,10 @@ export const setupRoutes = (fastify) => {
                 const idx = Math.min(parseInt(index, 10) || 0, results.length - 1);
                 item = results[idx];
             } else {
-                item = results.find(r => r.name.toLowerCase() === q.toLowerCase()) || results[0];
+                // Exact match first, then case-insensitive, then first result (already best-scored)
+                item = results.find(r => r.name === q)
+                    || results.find(r => r.name.toLowerCase() === q.toLowerCase())
+                    || results[0];
             }
 
             const slug = item.slug || item.url_name || item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
