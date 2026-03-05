@@ -77,7 +77,10 @@ function isCloudflareBlock(html, title) {
     );
 }
 
-// ─── Search — direct HTTP fetch, no browser needed ────────────────────────────
+// ─── Search ───────────────────────────────────────────────────────────────────
+// Reuses the persistent session page (already on nanoreview.net with CF cookies)
+// to fire all search API calls in parallel via route interception.
+// No new page opened, no navigation — just intercept + evaluate = very fast.
 export const searchDevices = async (context, query, limit = 5) => {
     const cacheKey = `${query.toLowerCase()}-${limit}`;
     const cached = searchCache.get(cacheKey);
@@ -85,26 +88,86 @@ export const searchDevices = async (context, query, limit = 5) => {
 
     const types = detectLikelyTypes(query);
 
-    const fetchType = async (type) => {
-        try {
-            const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
-            const res = await fetch(url, {
-                headers: {
-                    'Accept': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                    'Referer': 'https://nanoreview.net/',
-                },
-                signal: AbortSignal.timeout(5000),
-            });
-            if (!res.ok) return [];
-            const data = await res.json();
-            return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
-        } catch {
-            return [];
-        }
-    };
+    // Get the shared browser state including session page
+    const { sessionPage, sessionReady } = await import('./browser.js').then(m => m.getBrowserContext());
 
-    const allResults = (await Promise.all(types.map(fetchType))).flat();
+    let allResults = [];
+
+    if (sessionReady && sessionPage) {
+        // Fast path: fire fetches from within the already-open session page
+        // This carries CF cookies automatically since the page is on nanoreview.net
+        try {
+            const raw = await sessionPage.evaluate(async ({ query, limit, types }) => {
+                const results = await Promise.all(types.map(async (type) => {
+                    try {
+                        const res = await fetch(
+                            `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`,
+                            { headers: { 'Accept': 'application/json' } }
+                        );
+                        if (!res.ok) return [];
+                        const ct = res.headers.get('content-type') || '';
+                        if (!ct.includes('application/json')) return [];
+                        const data = await res.json();
+                        return Array.isArray(data)
+                            ? data.map(r => ({ ...r, content_type: r.content_type || type }))
+                            : [];
+                    } catch {
+                        return [];
+                    }
+                }));
+                return results.flat();
+            }, { query, limit, types });
+            allResults = raw;
+        } catch (err) {
+            console.warn('[search] Session page evaluate failed:', err.message);
+        }
+    }
+
+    // Fallback: open a fresh page, navigate to nanoreview, then fetch
+    if (!allResults.length) {
+        console.log('[search] Falling back to fresh page navigation for search');
+        const page = await context.newPage();
+        try {
+            await page.route('**/*', (route) => {
+                const t = route.request().resourceType();
+                if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
+                else route.continue();
+            });
+
+            await safeNavigate(page, 'https://nanoreview.net/en/', {
+                waitUntil: 'domcontentloaded',
+                timeout: 20000,
+            });
+
+            for (let i = 0; i < 6; i++) {
+                const title = await page.title().catch(() => '');
+                if (!/just a moment|attention required/i.test(title)) break;
+                await page.waitForTimeout(1500);
+            }
+
+            allResults = await page.evaluate(async ({ query, limit, types }) => {
+                const results = await Promise.all(types.map(async (type) => {
+                    try {
+                        const res = await fetch(
+                            `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`,
+                            { headers: { 'Accept': 'application/json' } }
+                        );
+                        if (!res.ok) return [];
+                        const data = await res.json();
+                        return Array.isArray(data)
+                            ? data.map(r => ({ ...r, content_type: r.content_type || type }))
+                            : [];
+                    } catch {
+                        return [];
+                    }
+                }));
+                return results.flat();
+            }, { query, limit, types });
+        } finally {
+            await page.close();
+        }
+    }
+
     if (!allResults.length) return [];
 
     allResults.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
