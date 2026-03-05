@@ -58,32 +58,60 @@ function scoreMatch(name, q) {
 }
 
 // ─── Search ───────────────────────────────────────────────────────────────────
+// NanoReview's search API also supports querying without a type filter.
+// We try that first as a fast path, then fall back to per-type queries.
+async function fetchSearchType(query, type, limit) {
+    const url = type
+        ? `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`
+        : `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+    try {
+        const res = await fetch(url, { headers: JSON_HEADERS, signal: AbortSignal.timeout(8000) });
+        if (!res.ok) return [];
+        const ct = res.headers.get('content-type') || '';
+        if (!ct.includes('json')) return [];
+        const data = await res.json();
+        return Array.isArray(data)
+            ? data.map(r => ({ ...r, content_type: r.content_type || type || 'phone' }))
+            : [];
+    } catch {
+        return [];
+    }
+}
+
 export async function searchDevices(_context, query, limit = 5) {
     const key = `${query.toLowerCase()}-${limit}`;
     const hit = searchCache.get(key);
     if (hit && Date.now() - hit.ts < SEARCH_TTL) return hit.data;
 
-    const types = detectTypes(query).slice(0, 3);
+    // Fast path: query without a type filter — returns mixed results
+    const untyped = await fetchSearchType(query, null, limit);
+    if (untyped.length > 0) {
+        untyped.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
+        searchCache.set(key, { data: untyped, ts: Date.now() });
+        evict(searchCache);
+        return untyped;
+    }
 
-    const all = (await Promise.all(types.map(async (type) => {
-        try {
-            const res = await fetch(
-                `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`,
-                { headers: JSON_HEADERS, signal: AbortSignal.timeout(8000) }
-            );
-            if (!res.ok) return [];
-            const ct = res.headers.get('content-type') || '';
-            if (!ct.includes('json')) return [];
-            const data = await res.json();
-            return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
-        } catch { return []; }
-    }))).flat();
+    // Fallback: try all prioritised types (no slice cap)
+    const types = detectTypes(query);
+    const all = (await Promise.all(
+        types.map(type => fetchSearchType(query, type, limit))
+    )).flat();
 
     if (!all.length) return [];
-    all.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
-    searchCache.set(key, { data: all, ts: Date.now() });
+
+    // Deduplicate by name
+    const seen = new Set();
+    const deduped = all.filter(r => {
+        if (seen.has(r.name)) return false;
+        seen.add(r.name);
+        return true;
+    });
+
+    deduped.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
+    searchCache.set(key, { data: deduped, ts: Date.now() });
     evict(searchCache);
-    return all;
+    return deduped;
 }
 
 // ─── Slug from search result ──────────────────────────────────────────────────

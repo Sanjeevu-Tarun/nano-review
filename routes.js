@@ -76,7 +76,7 @@ export function setupRoutes(fastify) {
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
         try {
             const results = await searchDevices(null, q, 5);
-            if (!results.length) return reply.status(404).send({ success: false, error: 'No devices found' });
+            if (!results.length) return reply.status(404).send({ success: false, error: 'No devices found. The upstream nanoreview.net search API may be temporarily unavailable or blocking the request.' });
             let item;
             if (index !== undefined) {
                 const idx = Math.min(parseInt(index, 10) || 0, results.length - 1);
