@@ -25,17 +25,39 @@ export function setupRoutes(fastify) {
                 signal: AbortSignal.timeout(8000),
             });
             const body = await res.text();
-            results.search = { status: res.status, contentType: res.headers.get('content-type'), bodyPreview: body.substring(0, 300), isCF: body.includes('Just a moment') || body.includes('cf-browser-verification') };
-        } catch (e) { results.search = { error: e.message }; }
+            let slug = null;
+            let parsedResults = [];
+            try { 
+                parsedResults = JSON.parse(body);
+                const first = parsedResults[0];
+                slug = first?.slug || first?.url_name || first?.name?.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+            } catch {}
+            results.search = { status: res.status, bodyPreview: body.substring(0, 300), generatedSlug: slug, firstResult: parsedResults[0] };
 
-        try {
-            const res = await fetch('https://nanoreview.net/en/phone/iphone-15', {
-                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'text/html' },
-                signal: AbortSignal.timeout(8000),
-            });
-            const body = await res.text();
-            results.devicePage = { status: res.status, length: body.length, hasNuxt: body.includes('__NUXT__'), isCF: body.includes('Just a moment') || body.includes('cf-browser-verification'), preview: body.substring(0, 300) };
-        } catch (e) { results.devicePage = { error: e.message }; }
+            // Now fetch the actual device page using the real slug
+            if (slug) {
+                const pageRes = await fetch(`https://nanoreview.net/en/phone/${slug}`, {
+                    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'text/html' },
+                    signal: AbortSignal.timeout(8000),
+                });
+                const pageBody = await pageRes.text();
+                results.devicePage = {
+                    status: pageRes.status,
+                    length: pageBody.length,
+                    hasNuxt: pageBody.includes('__NUXT__'),
+                    hasNextData: pageBody.includes('__NEXT_DATA__'),
+                    hasNuxtPayload: pageBody.includes('__NUXT_PAYLOAD__'),
+                    hasNuxtData: pageBody.includes('nuxt-data'),
+                    hasWindowData: pageBody.includes('window.__'),
+                    isCF: pageBody.includes('Just a moment') || pageBody.includes('cf-browser-verification'),
+                    // Show all window.__ assignments
+                    windowVars: (pageBody.match(/window\.__[A-Z_]+/g) || []),
+                    // Show all inline script tags start
+                    scriptPreviews: (pageBody.match(/<script[^>]*>[\s\S]{0,100}/g) || []).slice(0, 5),
+                    preview: pageBody.substring(0, 500),
+                };
+            }
+        } catch (e) { results.error = e.message; }
 
         return reply.send({ success: true, debug: results });
     });
