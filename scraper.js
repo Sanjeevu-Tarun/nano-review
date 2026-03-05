@@ -106,12 +106,9 @@ export const searchDevices = async (context, query, limit = 5) => {
     return allResults;
 };
 
-// ─── Device data via API interception ────────────────────────────────────────
-// Instead of scraping rendered HTML (slow), we:
-//   1. Navigate to the device page
-//   2. Intercept all XHR/fetch JSON responses the SPA makes while loading
-//   3. Collect the data directly from the API responses — no HTML parsing
-//   4. Abort images/fonts/CSS to make navigation as fast as possible
+// ─── Device data via API interception with early-exit ────────────────────────
+// Key insight: NanoReview SPA fires one main JSON request with all device data.
+// We intercept it and resolve IMMEDIATELY — never wait for full page load.
 export const scrapeDevicePage = async (context, deviceUrl) => {
     const hit = deviceCache.get(deviceUrl);
     if (hit && Date.now() - hit.timestamp < DEVICE_TTL) return hit.data;
@@ -119,18 +116,19 @@ export const scrapeDevicePage = async (context, deviceUrl) => {
     const page = await context.newPage();
     const intercepted = [];
 
+    // This promise resolves the moment we capture a "good enough" JSON response
+    let resolveEarly;
+    const earlyData = new Promise(r => { resolveEarly = r; });
+
     try {
-        // Intercept every JSON response the page makes
         await page.route('**/*', async (route) => {
-            const req = route.request();
+            const req  = route.request();
             const type = req.resourceType();
 
-            // Hard-abort anything that can't contain device data
-            if (['font', 'media', 'image', 'stylesheet'].includes(type)) {
+            // Abort all non-data resources immediately — big speed win
+            if (['font', 'media', 'image', 'stylesheet'].includes(type))
                 return route.abort();
-            }
 
-            // For fetch/xhr, intercept and capture JSON
             if (type === 'fetch' || type === 'xhr') {
                 try {
                     const response = await route.fetch();
@@ -139,7 +137,12 @@ export const scrapeDevicePage = async (context, deviceUrl) => {
                         try {
                             const body = await response.json();
                             intercepted.push({ url: req.url(), data: body });
-                        } catch { /* not valid JSON */ }
+
+                            // Early-exit: if this response has specs + name, we have everything
+                            if (body?.name && (body?.specs || body?.characteristics)) {
+                                resolveEarly('api');
+                            }
+                        } catch {}
                     }
                     return route.fulfill({ response });
                 } catch {
@@ -150,31 +153,47 @@ export const scrapeDevicePage = async (context, deviceUrl) => {
             return route.continue();
         });
 
-        await safeNavigate(page, deviceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        // Start navigation — don't await fully, race against our data interceptor
+        const navPromise = safeNavigate(page, deviceUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 20000,
+        });
 
-        // Wait for CF to clear if needed
-        for (let i = 0; i < 6; i++) {
-            const title = await page.title().catch(() => '');
-            const html  = await page.content().catch(() => '');
-            if (!isCFBlock(html, title)) break;
-            if (i === 3) await reWarmCloudflare();
-            await page.waitForTimeout(1500);
+        // Race: either we get the API data early, or domcontentloaded fires, or 12s timeout
+        await Promise.race([
+            earlyData,
+            navPromise,
+            page.waitForTimeout(12000),
+        ]);
+
+        // If we already have good intercepted data, skip everything else
+        let data = buildDeviceData(deviceUrl, intercepted);
+        if (data.title && Object.keys(data.specs).length > 0) {
+            deviceCache.set(deviceUrl, { data, timestamp: Date.now() });
+            evict(deviceCache);
+            return data;
         }
 
-        // Wait for the SPA to fire its data requests (network goes quiet)
-        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+        // Check for CF block — only read title (fast), not full HTML
+        const title = await page.title().catch(() => '');
+        if (isCFBlock('', title)) {
+            await reWarmCloudflare();
+            // Wait a bit more for CF to resolve and SPA to re-fire its requests
+            await page.waitForTimeout(3000);
+            data = buildDeviceData(deviceUrl, intercepted);
+        }
 
-        // Build response from intercepted API data
-        const data = buildDeviceData(deviceUrl, intercepted);
-
-        // Fallback: if API interception got nothing useful, parse the HTML
+        // Final fallback: parse HTML if still no data
         if (!data.title || Object.keys(data.specs).length === 0) {
             const html = await page.content();
-            const title = await page.title().catch(() => '');
-            if (!isCFBlock(html, title)) {
-                return _parseHtml(html, deviceUrl);
+            const pageTitle = await page.title().catch(() => '');
+            if (!isCFBlock(html, pageTitle)) {
+                const parsed = _parseHtml(html, deviceUrl);
+                deviceCache.set(deviceUrl, { data: parsed, timestamp: Date.now() });
+                evict(deviceCache);
+                return parsed;
             }
-            throw new Error('Cloudflare blocked the device page. Try again in a moment.');
+            throw new Error('Cloudflare is blocking the device page. Try again shortly.');
         }
 
         deviceCache.set(deviceUrl, { data, timestamp: Date.now() });
@@ -340,6 +359,8 @@ export const scrapeComparePage = async (context, compareUrl) => {
 
     const page = await context.newPage();
     const intercepted = [];
+    let resolveEarly;
+    const earlyData = new Promise(r => { resolveEarly = r; });
 
     try {
         await page.route('**/*', async (route) => {
@@ -351,7 +372,11 @@ export const scrapeComparePage = async (context, compareUrl) => {
                     const response = await route.fetch();
                     const ct = response.headers()['content-type'] || '';
                     if (ct.includes('application/json')) {
-                        try { intercepted.push({ url: req.url(), data: await response.json() }); } catch {}
+                        try {
+                            const body = await response.json();
+                            intercepted.push({ url: req.url(), data: body });
+                            if (body?.devices || body?.comparison) resolveEarly('api');
+                        } catch {}
                     }
                     return route.fulfill({ response });
                 } catch { return route.continue(); }
@@ -359,16 +384,17 @@ export const scrapeComparePage = async (context, compareUrl) => {
             return route.continue();
         });
 
-        await safeNavigate(page, compareUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+        await Promise.race([
+            earlyData,
+            safeNavigate(page, compareUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }),
+            page.waitForTimeout(12000),
+        ]);
 
-        const data = buildCompareData(compareUrl, intercepted);
-
-        // HTML fallback
+        let data = buildCompareData(compareUrl, intercepted);
         if (!data.title) {
             const html  = await page.content();
             const title = await page.title().catch(() => '');
-            if (!isCFBlock(html, title)) return _parseCompareHtml(html, compareUrl);
+            if (!isCFBlock(html, title)) data = _parseCompareHtml(html, compareUrl);
         }
 
         deviceCache.set(compareUrl, { data, timestamp: Date.now() });
@@ -452,6 +478,8 @@ export const scrapeRankingPage = async (context, rankingUrl) => {
 
     const page = await context.newPage();
     const intercepted = [];
+    let resolveEarly;
+    const earlyData = new Promise(r => { resolveEarly = r; });
 
     try {
         await page.route('**/*', async (route) => {
@@ -463,7 +491,12 @@ export const scrapeRankingPage = async (context, rankingUrl) => {
                     const response = await route.fetch();
                     const ct = response.headers()['content-type'] || '';
                     if (ct.includes('application/json')) {
-                        try { intercepted.push({ url: req.url(), data: await response.json() }); } catch {}
+                        try {
+                            const body = await response.json();
+                            intercepted.push({ url: req.url(), data: body });
+                            const list = Array.isArray(body) ? body : (body?.data || body?.items || body?.list);
+                            if (Array.isArray(list) && list.length > 5) resolveEarly('api');
+                        } catch {}
                     }
                     return route.fulfill({ response });
                 } catch { return route.continue(); }
@@ -471,19 +504,18 @@ export const scrapeRankingPage = async (context, rankingUrl) => {
             return route.continue();
         });
 
-        await safeNavigate(page, rankingUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+        await Promise.race([
+            earlyData,
+            safeNavigate(page, rankingUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }),
+            page.waitForTimeout(12000),
+        ]);
 
-        // Try to get ranking data from intercepted API calls
+        // Try intercepted data first
         let rankings = [];
         for (const { data: body } of intercepted) {
-            if (Array.isArray(body) && body.length > 0 && (body[0]?.name || body[0]?.rank)) {
-                rankings = body;
-                break;
-            }
-            if (body?.data && Array.isArray(body.data)) { rankings = body.data; break; }
-            if (body?.items && Array.isArray(body.items)) { rankings = body.items; break; }
-            if (body?.list  && Array.isArray(body.list))  { rankings = body.list;  break; }
+            const list = Array.isArray(body) ? body
+                : (body?.data || body?.items || body?.list);
+            if (Array.isArray(list) && list.length > 0) { rankings = list; break; }
         }
 
         if (rankings.length) {
@@ -503,29 +535,27 @@ export const scrapeRankingPage = async (context, rankingUrl) => {
             return data;
         }
 
-        // HTML fallback for rankings
+        // HTML fallback
         const html  = await page.content();
         const title = await page.title().catch(() => '');
-        if (!isCFBlock(html, title)) {
-            const $ = cheerio.load(html);
-            const data = { title: $('h1').first().text().trim(), sourceUrl: rankingUrl, rankings: [] };
-            const headers = [];
-            $('table thead th').each((_, th) => headers.push($(th).text().trim()));
-            $('table tbody tr').each((_, row) => {
-                const item = {};
-                $(row).find('td').each((i, td) => {
-                    const key = headers[i] ? headers[i].toLowerCase().replace(/\s+/g, '_') : `col_${i}`;
-                    item[key] = $(td).text().trim();
-                    const a = $(td).find('a').attr('href');
-                    if (a && !item.url) item.url = a.startsWith('http') ? a : `https://nanoreview.net${a}`;
-                });
-                if (Object.keys(item).length) data.rankings.push(item);
+        if (isCFBlock(html, title)) throw new Error('Cloudflare blocked the rankings page.');
+        const $ = cheerio.load(html);
+        const data = { title: $('h1').first().text().trim(), sourceUrl: rankingUrl, rankings: [] };
+        const headers = [];
+        $('table thead th').each((_, th) => headers.push($(th).text().trim()));
+        $('table tbody tr').each((_, row) => {
+            const item = {};
+            $(row).find('td').each((i, td) => {
+                const key = headers[i] ? headers[i].toLowerCase().replace(/\s+/g, '_') : `col_${i}`;
+                item[key] = $(td).text().trim();
+                const a = $(td).find('a').attr('href');
+                if (a && !item.url) item.url = a.startsWith('http') ? a : `https://nanoreview.net${a}`;
             });
-            deviceCache.set(rankingUrl, { data, timestamp: Date.now() });
-            evict(deviceCache);
-            return data;
-        }
-        throw new Error('Cloudflare blocked the rankings page.');
+            if (Object.keys(item).length) data.rankings.push(item);
+        });
+        deviceCache.set(rankingUrl, { data, timestamp: Date.now() });
+        evict(deviceCache);
+        return data;
     } finally {
         await page.close();
     }

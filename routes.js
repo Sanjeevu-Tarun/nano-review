@@ -22,7 +22,6 @@ export const setupRoutes = (fastify) => {
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
 
         try {
-            // getBrowserContext() returns the SAME browser/context on every call
             const { context } = await getBrowserContext();
 
             const results = await searchDevices(context, q, 5);
@@ -36,13 +35,11 @@ export const setupRoutes = (fastify) => {
                 item = results.find(r => r.name.toLowerCase() === q.toLowerCase()) || results[0];
             }
 
+            // Scrape device page (search already done — start immediately)
             const data = await scrapeDevicePage(context, toDeviceUrl(item));
             data.matchedQuery = q;
             data.searchResults = results.map((r, i) => ({
-                index: i,
-                name: r.name,
-                type: r.content_type,
-                slug: r.slug || r.url_name,
+                index: i, name: r.name, type: r.content_type, slug: r.slug || r.url_name,
             }));
 
             return reply.send({ success: true, contentType: 'device_details', data });
