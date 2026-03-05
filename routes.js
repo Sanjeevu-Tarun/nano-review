@@ -13,70 +13,39 @@ function toDeviceUrl(item) {
     return `https://nanoreview.net/en/${item.content_type}/${slug}`;
 }
 
-export const setupRoutes = (fastify) => {
+export function setupRoutes(fastify) {
 
-    // ── /api/debug — shows exactly what nanoreview returns ───────────────────
     fastify.get('/api/debug', async (req, reply) => {
         const { q = 'iphone 15' } = req.query;
         const results = {};
-
-        // Test search API
         try {
             const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(q)}&limit=2&type=phone`;
             const res = await fetch(url, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'application/json',
-                    'Referer': 'https://nanoreview.net/',
-                },
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'application/json' },
                 signal: AbortSignal.timeout(8000),
             });
-            const ct = res.headers.get('content-type') || '';
             const body = await res.text();
-            results.search = {
-                status: res.status,
-                contentType: ct,
-                bodyPreview: body.substring(0, 300),
-                isJson: ct.includes('application/json'),
-                isCF: body.includes('cf-browser-verification') || body.includes('Just a moment'),
-            };
-        } catch(e) {
-            results.search = { error: e.message };
-        }
+            results.search = { status: res.status, contentType: res.headers.get('content-type'), bodyPreview: body.substring(0, 300), isCF: body.includes('Just a moment') || body.includes('cf-browser-verification') };
+        } catch (e) { results.search = { error: e.message }; }
 
-        // Test device page HTML
         try {
             const res = await fetch('https://nanoreview.net/en/phone/iphone-15', {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'text/html,*/*',
-                },
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'text/html' },
                 signal: AbortSignal.timeout(8000),
             });
             const body = await res.text();
-            results.devicePage = {
-                status: res.status,
-                bodyLength: body.length,
-                hasNuxt: body.includes('__NUXT__'),
-                hasNextData: body.includes('__NEXT_DATA__'),
-                hasCF: body.includes('cf-browser-verification') || body.includes('Just a moment'),
-                bodyPreview: body.substring(0, 200),
-            };
-        } catch(e) {
-            results.devicePage = { error: e.message };
-        }
+            results.devicePage = { status: res.status, length: body.length, hasNuxt: body.includes('__NUXT__'), isCF: body.includes('Just a moment') || body.includes('cf-browser-verification'), preview: body.substring(0, 300) };
+        } catch (e) { results.devicePage = { error: e.message }; }
 
         return reply.send({ success: true, debug: results });
     });
 
-
+    fastify.get('/api/search', async (req, reply) => {
         const { q, index } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
-
         try {
             const results = await searchDevices(null, q, 5);
             if (!results.length) return reply.status(404).send({ success: false, error: 'No devices found' });
-
             let item;
             if (index !== undefined) {
                 const idx = Math.min(parseInt(index, 10) || 0, results.length - 1);
@@ -84,13 +53,11 @@ export const setupRoutes = (fastify) => {
             } else {
                 item = results.find(r => r.name.toLowerCase() === q.toLowerCase()) || results[0];
             }
-
             const data = await scrapeDevicePage(null, toDeviceUrl(item));
             data.matchedQuery = q;
             data.searchResults = results.map((r, i) => ({
                 index: i, name: r.name, type: r.content_type, slug: r.slug || r.url_name,
             }));
-
             return reply.send({ success: true, contentType: 'device_details', data });
         } catch (error) {
             return reply.status(500).send({ success: false, error: error.message });
@@ -100,21 +67,17 @@ export const setupRoutes = (fastify) => {
     fastify.get('/api/compare', async (req, reply) => {
         const { q1, q2 } = req.query;
         if (!q1 || !q2) return reply.status(400).send({ success: false, error: 'Parameters "q1" and "q2" are required' });
-
         try {
             const [results1, results2] = await Promise.all([
                 searchDevices(null, q1, 3),
                 searchDevices(null, q2, 3),
             ]);
-            if (!results1.length || !results2.length)
-                return reply.status(404).send({ success: false, error: 'One or both devices not found' });
-
+            if (!results1.length || !results2.length) return reply.status(404).send({ success: false, error: 'One or both devices not found' });
             const item1 = results1.find(r => r.name.toLowerCase() === q1.toLowerCase()) || results1[0];
             const item2 = results2.find(r => r.name.toLowerCase() === q2.toLowerCase()) || results2[0];
             const slug1 = item1.slug || item1.url_name || item1.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
             const slug2 = item2.slug || item2.url_name || item2.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
             const compareUrl = `https://nanoreview.net/en/${item1.content_type}-compare/${slug1}-vs-${slug2}`;
-
             const data = await scrapeComparePage(null, compareUrl);
             return reply.send({ success: true, contentType: 'comparison', data });
         } catch (error) {
@@ -125,7 +88,6 @@ export const setupRoutes = (fastify) => {
     fastify.get('/api/suggestions', async (req, reply) => {
         const { q } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
-
         try {
             const results = await searchDevices(null, q, 10);
             const data = results.map((r, i) => {
@@ -143,7 +105,6 @@ export const setupRoutes = (fastify) => {
         if (!type) return reply.status(400).send({ success: false, error: 'Query parameter "type" is required' });
         const targetUrl = RANKING_URLS[type];
         if (!targetUrl) return reply.status(400).send({ success: false, error: 'Invalid type' });
-
         try {
             const data = await scrapeRankingPage(null, targetUrl);
             return reply.send({ success: true, contentType: 'rankings', data });
@@ -151,4 +112,4 @@ export const setupRoutes = (fastify) => {
             return reply.status(500).send({ success: false, error: error.message });
         }
     });
-};
+}
