@@ -110,17 +110,48 @@ export const searchDevices = async (_context, query, limit = 5) => {
 
     const types = detectLikelyTypes(query);
 
-    const results = (await Promise.all(types.map(async (type) => {
+    // Only fetch the top 2 most-likely types to cut latency
+    const topTypes = types.slice(0, 2);
+    const results = (await Promise.all(topTypes.map(async (type) => {
         try {
             const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
             const res = await fetchWithCookies(url, { headers: JSON_HEADERS });
-            if (!res.ok) return [];
             const ct = res.headers.get('content-type') || '';
-            if (!ct.includes('application/json')) return [];
+            console.log(`[search] ${type} → HTTP ${res.status} | ct: ${ct.substring(0,40)}`);
+            if (!res.ok) {
+                const body = await res.text();
+                console.log(`[search] ${type} error body (100):`, body.substring(0, 100));
+                return [];
+            }
+            if (!ct.includes('application/json')) {
+                const body = await res.text();
+                console.log(`[search] ${type} non-json body (200):`, body.substring(0, 200));
+                return [];
+            }
             const data = await res.json();
+            console.log(`[search] ${type} → ${Array.isArray(data) ? data.length : 0} results`);
             return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
-        } catch { return []; }
+        } catch (e) {
+            console.log(`[search] ${type} exception:`, e.message);
+            return [];
+        }
     }))).flat();
+
+    // If top types found nothing, try remaining types
+    if (!results.length) {
+        const remaining = types.slice(2);
+        const extra = (await Promise.all(remaining.map(async (type) => {
+            try {
+                const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
+                const res = await fetchWithCookies(url, { headers: JSON_HEADERS });
+                const ct = res.headers.get('content-type') || '';
+                if (!res.ok || !ct.includes('application/json')) return [];
+                const data = await res.json();
+                return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
+            } catch { return []; }
+        }))).flat();
+        results.push(...extra);
+    }
 
     if (!results.length) return [];
     results.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));

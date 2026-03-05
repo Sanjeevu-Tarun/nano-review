@@ -15,7 +15,61 @@ function toDeviceUrl(item) {
 
 export const setupRoutes = (fastify) => {
 
-    fastify.get('/api/search', async (req, reply) => {
+    // ── /api/debug — shows exactly what nanoreview returns ───────────────────
+    fastify.get('/api/debug', async (req, reply) => {
+        const { q = 'iphone 15' } = req.query;
+        const results = {};
+
+        // Test search API
+        try {
+            const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(q)}&limit=2&type=phone`;
+            const res = await fetch(url, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json',
+                    'Referer': 'https://nanoreview.net/',
+                },
+                signal: AbortSignal.timeout(8000),
+            });
+            const ct = res.headers.get('content-type') || '';
+            const body = await res.text();
+            results.search = {
+                status: res.status,
+                contentType: ct,
+                bodyPreview: body.substring(0, 300),
+                isJson: ct.includes('application/json'),
+                isCF: body.includes('cf-browser-verification') || body.includes('Just a moment'),
+            };
+        } catch(e) {
+            results.search = { error: e.message };
+        }
+
+        // Test device page HTML
+        try {
+            const res = await fetch('https://nanoreview.net/en/phone/iphone-15', {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'text/html,*/*',
+                },
+                signal: AbortSignal.timeout(8000),
+            });
+            const body = await res.text();
+            results.devicePage = {
+                status: res.status,
+                bodyLength: body.length,
+                hasNuxt: body.includes('__NUXT__'),
+                hasNextData: body.includes('__NEXT_DATA__'),
+                hasCF: body.includes('cf-browser-verification') || body.includes('Just a moment'),
+                bodyPreview: body.substring(0, 200),
+            };
+        } catch(e) {
+            results.devicePage = { error: e.message };
+        }
+
+        return reply.send({ success: true, debug: results });
+    });
+
+
         const { q, index } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
 
