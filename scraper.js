@@ -38,37 +38,36 @@ const solveCFAndExtractCookies = async () => {
 
 const ensureCFCookies = async () => {
     if (cfCookies && Date.now() < cfCookieExpiry) return;
-    await solveCFAndExtractCookies();
+    try {
+        await solveCFAndExtractCookies();
+    } catch (e) {
+        console.log('[CF] Cookie solving failed (non-fatal):', e.message);
+        // Set a dummy non-null value so we don't retry on every request
+        cfCookies = cfCookies || '';
+        cfCookieExpiry = Date.now() + 60000; // retry after 1 min
+    }
 };
 
 // ─── Lightweight node fetch (no browser page needed) ─────────────────────────
 const fetchWithCF = async (url) => {
     await ensureCFCookies();
-    const res = await fetch(url, {
-        headers: {
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cookie': cfCookies,
-            'User-Agent': cfUserAgent,
-            'Referer': 'https://nanoreview.net/en/',
-            'X-Requested-With': 'XMLHttpRequest',
-        },
-    });
-    // If CF blocks us, cookies expired — re-solve and retry once
+    const headers = {
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': cfUserAgent,
+        'Referer': 'https://nanoreview.net/en/',
+        'X-Requested-With': 'XMLHttpRequest',
+    };
+    if (cfCookies) headers['Cookie'] = cfCookies;
+
+    const res = await fetch(url, { headers });
+    // If CF blocks, try re-solving once
     if (res.status === 403 || res.status === 429) {
-        console.log(`[CF] Got ${res.status}, re-solving CF...`);
+        console.log(`[CF] Got ${res.status}, re-solving...`);
         cfCookies = null;
-        await solveCFAndExtractCookies();
-        return fetch(url, {
-            headers: {
-                'Accept': 'application/json',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Cookie': cfCookies,
-                'User-Agent': cfUserAgent,
-                'Referer': 'https://nanoreview.net/en/',
-                'X-Requested-With': 'XMLHttpRequest',
-            },
-        });
+        try { await solveCFAndExtractCookies(); } catch {}
+        if (cfCookies) headers['Cookie'] = cfCookies;
+        return fetch(url, { headers });
     }
     return res;
 };
@@ -91,7 +90,7 @@ const detectLikelyTypes = (query) => {
 };
 
 // ─── Search — pure Node fetch, no browser page ────────────────────────────────
-export const searchDevices = async (context, query, limit = 5) => {
+export const searchDevices = async (_context, query, limit = 5) => {
     const cacheKey = `${query.toLowerCase()}-${limit}`;
     const cached = searchCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) return cached.results;
