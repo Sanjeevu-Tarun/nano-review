@@ -9,7 +9,6 @@ await fastify.register(cors, {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
 });
 
-// Health check for Render
 fastify.get('/health', async () => ({ status: 'ok' }));
 
 setupRoutes(fastify);
