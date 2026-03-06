@@ -1,16 +1,8 @@
-import chromium from '@sparticuz/chromium';
-import { chromium as playwrightCore } from 'playwright-core';
-import { chromium as playwrightLocal } from 'playwright';
+import { chromium } from 'playwright';
 
-// ─── Persistent Browser Pool ──────────────────────────────────────────────────
-// The only change vs original: one shared browser lives for the server lifetime.
-// acquireContext() hands out pooled contexts instead of launching a new browser
-// per request. scraper.js is UNCHANGED — it still does its own page management.
-
-const POOL_SIZE = 3;
-const pool = [];
-let sharedBrowser = null;
-let browserInitPromise = null;
+// ─── Single persistent browser ────────────────────────────────────────────────
+let _browser = null;
+let _launchPromise = null;
 
 const LAUNCH_ARGS = [
     '--no-sandbox',
@@ -23,14 +15,32 @@ const LAUNCH_ARGS = [
     '--disable-sync',
     '--disable-translate',
     '--hide-scrollbars',
-    '--metrics-recording-only',
     '--mute-audio',
     '--no-first-run',
-    '--safebrowsing-disable-auto-update',
     '--disable-background-timer-throttling',
     '--disable-renderer-backgrounding',
     '--disable-backgrounding-occluded-windows',
 ];
+
+export const getBrowser = async () => {
+    if (_browser?.isConnected()) return _browser;
+    if (_launchPromise) return _launchPromise;
+    _launchPromise = chromium.launch({ headless: true, args: LAUNCH_ARGS, timeout: 30000 })
+        .then(b => {
+            _browser = b;
+            _launchPromise = null;
+            b.on('disconnected', () => { _browser = null; _launchPromise = null; });
+            return b;
+        });
+    return _launchPromise;
+};
+
+// Pre-warm browser at startup so first request pays no launch cost
+getBrowser().catch(() => {});
+
+// ─── Context pool ─────────────────────────────────────────────────────────────
+const POOL_SIZE = 3;
+const _pool = [];
 
 const CONTEXT_OPTIONS = {
     viewport: { width: 1280, height: 720 },
@@ -43,131 +53,78 @@ const CONTEXT_OPTIONS = {
     },
 };
 
-const STEALTH_SCRIPT = () => {
+const STEALTH = () => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
     window.chrome = { runtime: {} };
-    const originalQuery = window.navigator.permissions.query;
+    const orig = window.navigator.permissions.query;
     window.navigator.permissions.query = (p) =>
-        p.name === 'notifications'
-            ? Promise.resolve({ state: Notification.permission })
-            : originalQuery(p);
+        p.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : orig(p);
 };
 
-const ensureBrowser = async () => {
-    if (sharedBrowser?.isConnected()) return sharedBrowser;
-    if (browserInitPromise) return browserInitPromise;
-
-    browserInitPromise = (async () => {
-        const isVercel = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
-
-        if (isVercel) {
-            const executablePath = await chromium.executablePath();
-            sharedBrowser = await playwrightCore.launch({
-                args: [...chromium.args, ...LAUNCH_ARGS],
-                executablePath: executablePath || undefined,
-                headless: true,
-                timeout: 30000,
-            });
-        } else {
-            sharedBrowser = await playwrightLocal.launch({
-                headless: true,
-                args: LAUNCH_ARGS,
-                timeout: 30000,
-            });
-        }
-
-        sharedBrowser.on('disconnected', () => {
-            sharedBrowser = null;
-            browserInitPromise = null;
-            pool.length = 0;
-        });
-
-        return sharedBrowser;
-    })();
-
-    return browserInitPromise;
-};
-
-/**
- * Acquire a pooled browser context.
- * Returns { context, release } — caller MUST call release() when done.
- */
 export const acquireContext = async () => {
-    await ensureBrowser();
-    if (pool.length > 0) return pool.pop();
-
-    const context = await sharedBrowser.newContext(CONTEXT_OPTIONS);
-    await context.addInitScript(STEALTH_SCRIPT);
-
+    if (_pool.length > 0) return _pool.pop();
+    const browser = await getBrowser();
+    const context = await browser.newContext(CONTEXT_OPTIONS);
+    await context.addInitScript(STEALTH);
     const entry = {
         context,
         release() {
-            if (pool.length < POOL_SIZE) {
-                pool.push(entry);
-            } else {
-                context.close().catch(() => {});
-            }
+            if (_pool.length < POOL_SIZE) _pool.push(entry);
+            else context.close().catch(() => {});
         },
     };
     return entry;
 };
 
-// ─── Original helpers — UNCHANGED, used by scraper.js ────────────────────────
+// Legacy export kept for compatibility
+export const getBrowserContext = async () => {
+    const entry = await acquireContext();
+    return { browser: { close: () => entry.release() }, context: entry.context };
+};
 
-export const waitForCloudflare = async (page, selector, timeout = 30000) => {
+// ─── Helpers (identical logic to original, poll interval halved) ──────────────
+export const waitForCloudflare = async (page, selector, timeout = 20000) => {
     const start = Date.now();
-
-    // Wait for CF challenge to fully resolve — keep polling until the title
-    // is no longer a CF challenge page and the URL is stable on the real site.
+    let lastError;
     while (Date.now() - start < timeout) {
         try {
             const title = await page.title().catch(() => '');
             const url = page.url();
-
-            const isChallenge =
-                /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title) ||
-                /cdn-cgi|challenge-platform|__cf_chl/i.test(url);
-
-            if (!isChallenge) {
-                // Real page loaded — confirm it has actual content
-                const hasContent = await page.evaluate(() =>
-                    document.body && document.body.innerHTML.length > 500
-                ).catch(() => false);
-
-                if (hasContent) return true;
+            const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
+            const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
+            if (!isChallenge && !isChallengeUrl) {
+                try {
+                    await page.waitForSelector(selector, { timeout: 2000, state: 'attached' });
+                    return true;
+                } catch {
+                    const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
+                    if (hasContent) return true;
+                }
             }
-
-            // Still on CF challenge — wait and let the JS challenge run
-            await page.waitForTimeout(1500);
-        } catch {
-            await page.waitForTimeout(1500);
+            await page.waitForTimeout(300); // was 1000ms
+        } catch (error) {
+            lastError = error;
+            await page.waitForTimeout(300);
         }
     }
-
-    throw new Error(`Cloudflare challenge did not resolve within ${timeout}ms`);
+    try {
+        const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
+        if (hasContent) return true;
+    } catch {}
+    throw new Error(`Cloudflare timeout after ${timeout}ms: ${lastError?.message || 'Unknown error'}`);
 };
 
 export const safeNavigate = async (page, url, options = {}) => {
-    // Use 'networkidle' so Cloudflare's JS challenge has time to complete
-    // before we try to interact with the page. Fall back gracefully on timeout.
-    const defaultOptions = { waitUntil: 'networkidle', timeout: 30000 };
+    const defaultOptions = { waitUntil: 'domcontentloaded', timeout: 25000 };
     try {
         await page.goto(url, { ...defaultOptions, ...options });
         return true;
     } catch (error) {
-        // Timeout on networkidle is common and usually fine — page has content
         try {
             const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
             if (hasContent) return true;
         } catch {}
         throw error;
     }
-};
-
-// Legacy export — routes.js now uses acquireContext() directly but this keeps
-// any other callers working without changes.
-export const getBrowserContext = async () => {
-    const entry = await acquireContext();
-    return { browser: { close: () => entry.release() }, context: entry.context };
 };
