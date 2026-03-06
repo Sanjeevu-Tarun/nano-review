@@ -4,6 +4,9 @@ import { waitForCloudflare, safeNavigate } from './browser.js';
 const searchCache = new Map();
 const CACHE_TTL = 300000;
 
+// Track which contexts have been warmed up (CF cookies obtained)
+const warmedContexts = new WeakSet();
+
 const detectLikelyTypes = (query) => {
     const q = query.toLowerCase();
     const allTypes = ['phone', 'tablet', 'laptop', 'soc', 'cpu', 'gpu'];
@@ -32,8 +35,6 @@ const blockHeavyResources = (page, blockStylesheets = false) =>
     });
 
 // ─── Smart content-ready wait ─────────────────────────────────────────────────
-// Replaces the hardcoded page.waitForTimeout(1000) with a smarter check:
-// wait for the DOM to stop mutating OR 1.5 s max, whichever comes first.
 const waitForContentReady = async (page, maxMs = 1500) => {
     await page.evaluate((max) => new Promise((resolve) => {
         let timer;
@@ -42,17 +43,31 @@ const waitForContentReady = async (page, maxMs = 1500) => {
             timer = setTimeout(() => { observer.disconnect(); resolve(); }, 150);
         });
         observer.observe(document.body, { childList: true, subtree: true });
-        // Hard upper bound
         setTimeout(() => { observer.disconnect(); resolve(); }, max);
-        // Also resolve immediately if body already has content
         if (document.body.innerHTML.length > 500) { observer.disconnect(); resolve(); }
     }), maxMs);
 };
 
-// ─── Search ───────────────────────────────────────────────────────────────────
-// Key change: no longer navigates to homepage (cookie warm-up is done once in
-// browser.js when the context is first created).  Just fire the API requests.
+// ─── Ensure CF cookies on context (once per context) ─────────────────────────
+const ensureCookies = async (context) => {
+    if (warmedContexts.has(context)) return;
+    warmedContexts.add(context);
 
+    const page = await context.newPage();
+    try {
+        await page.route('**/*', (route) => {
+            const t = route.request().resourceType();
+            if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
+            else route.continue();
+        });
+        await safeNavigate(page, 'https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await waitForCloudflare(page, 'body', 12000).catch(() => {});
+    } finally {
+        await page.close();
+    }
+};
+
+// ─── Search ───────────────────────────────────────────────────────────────────
 export const searchDevices = async (context, query, limit = 5) => {
     const cacheKey = `${query.toLowerCase()}-${limit}`;
     const cached = searchCache.get(cacheKey);
@@ -60,48 +75,47 @@ export const searchDevices = async (context, query, limit = 5) => {
 
     const types = detectLikelyTypes(query);
 
-    // Use a lightweight page just to run fetch() inside the browser context
-    // so CF cookies are passed automatically.
+    // Ensure CF cookies are set on this context before making API calls
+    await ensureCookies(context);
+
     const page = await context.newPage();
     try {
-        await blockHeavyResources(page, true);
+        // Only block fonts/media/images — NOT stylesheets (CF challenge may need them)
+        await blockHeavyResources(page, false);
 
-        // Navigate to a minimal page to get CF cookies if not yet done
-        // (warmUpCookies in browser.js handles this, but as a fallback)
-        const currentUrl = page.url();
-        if (!currentUrl.includes('nanoreview.net')) {
-            await safeNavigate(page, 'https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-            try {
-                await waitForCloudflare(page, 'body', 8000);
-            } catch {
-                const hasContent = await page.evaluate(() => document.body?.innerHTML.length > 100).catch(() => false);
-                if (!hasContent) throw new Error('Page failed to load');
-            }
-        }
+        // Navigate to the domain so fetch() runs in the correct origin with cookies
+        await safeNavigate(page, 'https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 25000 });
 
+        // Wait until not on a CF challenge page
+        await waitForCloudflare(page, 'body', 12000).catch(() => {});
+
+        // Fire all type searches in parallel from within the browser (carries CF cookies)
         const allResults = await page.evaluate(async ({ query, limit, types }) => {
+            const results = [];
             const fetchPromises = types.map(async (type) => {
                 try {
                     const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
                     const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 3000); // up from 2000
+                    const timeoutId = setTimeout(() => controller.abort(), 5000);
                     const response = await fetch(url, {
                         signal: controller.signal,
-                        headers: { 'Accept': 'application/json' },
+                        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
                     });
                     clearTimeout(timeoutId);
-                    if (!response.ok) return [];
+                    if (!response.ok) return;
                     const data = await response.json();
-                    return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
-                } catch {
-                    return [];
+                    if (Array.isArray(data)) {
+                        data.forEach(r => results.push({ ...r, content_type: r.content_type || type }));
+                    }
+                } catch (e) {
+                    // swallow per-type errors
                 }
             });
-            const resultsArrays = await Promise.all(fetchPromises);
-            return resultsArrays.flat();
+            await Promise.all(fetchPromises);
+            return results;
         }, { query, limit, types });
 
-        if (allResults.length === 0) return [];
+        if (!allResults || allResults.length === 0) return [];
 
         const scoreMatch = (name, q) => {
             const n = name.toLowerCase();
@@ -169,8 +183,6 @@ export const scrapeDevicePage = async (context, deviceUrl) => {
     try {
         await blockHeavyResources(page);
         await safeNavigate(page, deviceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-        // Smart wait instead of fixed 1000ms sleep
         await waitForContentReady(page, 1500);
 
         const html = await page.content();

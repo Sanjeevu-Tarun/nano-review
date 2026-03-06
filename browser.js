@@ -3,10 +3,10 @@ import { chromium as playwrightCore } from 'playwright-core';
 import { chromium as playwrightLocal } from 'playwright';
 
 // ─── Persistent Browser Pool ──────────────────────────────────────────────────
-// Instead of launching a new browser per request (expensive ~1-2s overhead),
-// we keep one browser alive and hand out contexts from a pool.
+// One shared browser lives for the server lifetime.
+// Contexts are pooled and reused — creating a context is cheap vs launching a browser.
 
-const POOL_SIZE = 3; // max concurrent idle contexts to keep warm
+const POOL_SIZE = 3;
 const pool = [];
 let sharedBrowser = null;
 let browserInitPromise = null;
@@ -29,7 +29,6 @@ const PERF_ARGS = [
     '--disable-background-timer-throttling',
     '--disable-renderer-backgrounding',
     '--disable-backgrounding-occluded-windows',
-    '--blink-settings=imagesEnabled=false', // skip image decoding at engine level
 ];
 
 const CONTEXT_OPTIONS = {
@@ -78,7 +77,6 @@ const ensureBrowser = async () => {
             });
         }
 
-        // Respawn on crash
         sharedBrowser.on('disconnected', () => {
             sharedBrowser = null;
             browserInitPromise = null;
@@ -91,26 +89,18 @@ const ensureBrowser = async () => {
     return browserInitPromise;
 };
 
-// ─── Context pool: acquire / release ─────────────────────────────────────────
+// ─── Context pool ─────────────────────────────────────────────────────────────
 /**
- * Acquire a browser context from the pool (or create a new one).
- * Returns an entry with { context, release() }.
- * Caller MUST call entry.release() when done.
+ * Acquire a browser context. Returns { context, release }.
+ * Caller MUST call release() when done to return it to the pool.
  */
 export const acquireContext = async () => {
     const browser = await ensureBrowser();
 
-    // Reuse an idle pooled context
-    if (pool.length > 0) {
-        return pool.pop();
-    }
+    if (pool.length > 0) return pool.pop();
 
-    // Create a fresh context (cheap compared to launching a browser)
     const context = await browser.newContext(CONTEXT_OPTIONS);
     await context.addInitScript(STEALTH_SCRIPT);
-
-    // Warm up CF cookies once per new context
-    await warmUpCookies(context);
 
     const entry = {
         context,
@@ -125,30 +115,7 @@ export const acquireContext = async () => {
     return entry;
 };
 
-// ─── One-time CF cookie warm-up per context ───────────────────────────────────
-// searchDevices used to navigate to the homepage on EVERY search just to get
-// cookies. We do it once here when a context is first created instead.
-const warmedContexts = new WeakSet();
-
-export const warmUpCookies = async (context) => {
-    if (warmedContexts.has(context)) return;
-    warmedContexts.add(context);
-
-    const page = await context.newPage();
-    try {
-        await page.route('**/*', (route) => {
-            const t = route.request().resourceType();
-            if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
-            else route.continue();
-        });
-        await safeNavigate(page, 'https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await waitForCloudflare(page, 'body', 10000).catch(() => {});
-    } finally {
-        await page.close();
-    }
-};
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers (used by scraper.js) ─────────────────────────────────────────────
 
 export const waitForCloudflare = async (page, selector, timeout = 20000) => {
     const start = Date.now();
@@ -158,7 +125,6 @@ export const waitForCloudflare = async (page, selector, timeout = 20000) => {
         try {
             const title = await page.title().catch(() => '');
             const url = await page.url().catch(() => '');
-
             const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
             const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
 
@@ -171,8 +137,7 @@ export const waitForCloudflare = async (page, selector, timeout = 20000) => {
                     if (hasContent) return true;
                 }
             }
-
-            await page.waitForTimeout(500); // was 1000ms — halved poll interval
+            await page.waitForTimeout(500);
         } catch (error) {
             lastError = error;
             await page.waitForTimeout(500);
