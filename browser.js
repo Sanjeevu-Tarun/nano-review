@@ -3,15 +3,16 @@ import { chromium as playwrightCore } from 'playwright-core';
 import { chromium as playwrightLocal } from 'playwright';
 
 // ─── Persistent Browser Pool ──────────────────────────────────────────────────
-// One shared browser lives for the server lifetime.
-// Contexts are pooled and reused — creating a context is cheap vs launching a browser.
+// The only change vs original: one shared browser lives for the server lifetime.
+// acquireContext() hands out pooled contexts instead of launching a new browser
+// per request. scraper.js is UNCHANGED — it still does its own page management.
 
 const POOL_SIZE = 3;
 const pool = [];
 let sharedBrowser = null;
 let browserInitPromise = null;
 
-const PERF_ARGS = [
+const LAUNCH_ARGS = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-blink-features=AutomationControlled',
@@ -53,7 +54,6 @@ const STEALTH_SCRIPT = () => {
             : originalQuery(p);
 };
 
-// ─── Launch the shared browser once ──────────────────────────────────────────
 const ensureBrowser = async () => {
     if (sharedBrowser?.isConnected()) return sharedBrowser;
     if (browserInitPromise) return browserInitPromise;
@@ -64,7 +64,7 @@ const ensureBrowser = async () => {
         if (isVercel) {
             const executablePath = await chromium.executablePath();
             sharedBrowser = await playwrightCore.launch({
-                args: [...chromium.args, ...PERF_ARGS],
+                args: [...chromium.args, ...LAUNCH_ARGS],
                 executablePath: executablePath || undefined,
                 headless: true,
                 timeout: 30000,
@@ -72,7 +72,7 @@ const ensureBrowser = async () => {
         } else {
             sharedBrowser = await playwrightLocal.launch({
                 headless: true,
-                args: PERF_ARGS,
+                args: LAUNCH_ARGS,
                 timeout: 30000,
             });
         }
@@ -89,17 +89,15 @@ const ensureBrowser = async () => {
     return browserInitPromise;
 };
 
-// ─── Context pool ─────────────────────────────────────────────────────────────
 /**
- * Acquire a browser context. Returns { context, release }.
- * Caller MUST call release() when done to return it to the pool.
+ * Acquire a pooled browser context.
+ * Returns { context, release } — caller MUST call release() when done.
  */
 export const acquireContext = async () => {
-    const browser = await ensureBrowser();
-
+    await ensureBrowser();
     if (pool.length > 0) return pool.pop();
 
-    const context = await browser.newContext(CONTEXT_OPTIONS);
+    const context = await sharedBrowser.newContext(CONTEXT_OPTIONS);
     await context.addInitScript(STEALTH_SCRIPT);
 
     const entry = {
@@ -115,7 +113,7 @@ export const acquireContext = async () => {
     return entry;
 };
 
-// ─── Helpers (used by scraper.js) ─────────────────────────────────────────────
+// ─── Original helpers — UNCHANGED, used by scraper.js ────────────────────────
 
 export const waitForCloudflare = async (page, selector, timeout = 20000) => {
     const start = Date.now();
@@ -137,10 +135,11 @@ export const waitForCloudflare = async (page, selector, timeout = 20000) => {
                     if (hasContent) return true;
                 }
             }
-            await page.waitForTimeout(500);
+
+            await page.waitForTimeout(1000);
         } catch (error) {
             lastError = error;
-            await page.waitForTimeout(500);
+            await page.waitForTimeout(1000);
         }
     }
 
@@ -164,4 +163,11 @@ export const safeNavigate = async (page, url, options = {}) => {
         } catch {}
         throw error;
     }
+};
+
+// Legacy export — routes.js now uses acquireContext() directly but this keeps
+// any other callers working without changes.
+export const getBrowserContext = async () => {
+    const entry = await acquireContext();
+    return { browser: { close: () => entry.release() }, context: entry.context };
 };

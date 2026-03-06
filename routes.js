@@ -1,19 +1,19 @@
 import { searchDevices, scrapeDevicePage, scrapeComparePage, scrapeRankingPage } from './scraper.js';
 import { acquireContext } from './browser.js';
 
-// Helper: acquire a pooled context, run fn(context), release it automatically.
+// Wraps every route: acquires a pooled context, runs fn, releases it back.
+// "release" returns the context to the pool instead of destroying the browser.
 const withContext = async (fn) => {
     const entry = await acquireContext();
     try {
         return await fn(entry.context);
     } finally {
-        entry.release(); // returns context to pool instead of closing browser
+        entry.release();
     }
 };
 
 export const setupRoutes = (fastify) => {
 
-    // ── /api/search ───────────────────────────────────────────────────────────
     fastify.get('/api/search', async (req, reply) => {
         const { q, index } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
@@ -21,7 +21,8 @@ export const setupRoutes = (fastify) => {
         try {
             return await withContext(async (context) => {
                 const results = await searchDevices(context, q, 5);
-                if (!results?.length) return reply.status(404).send({ success: false, error: 'No devices found' });
+                if (!results || results.length === 0)
+                    return reply.status(404).send({ success: false, error: 'No devices found' });
 
                 let item;
                 if (index !== undefined) {
@@ -50,14 +51,13 @@ export const setupRoutes = (fastify) => {
         }
     });
 
-    // ── /api/compare ──────────────────────────────────────────────────────────
     fastify.get('/api/compare', async (req, reply) => {
         const { q1, q2 } = req.query;
         if (!q1 || !q2) return reply.status(400).send({ success: false, error: 'Parameters "q1" and "q2" are required' });
 
         try {
             return await withContext(async (context) => {
-                // Search for both devices IN PARALLEL instead of sequentially
+                // Search both devices in parallel
                 const [results1, results2] = await Promise.all([
                     searchDevices(context, q1, 3),
                     searchDevices(context, q2, 3),
@@ -72,9 +72,7 @@ export const setupRoutes = (fastify) => {
                 const slug1 = item1.slug || item1.url_name || item1.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
                 const slug2 = item2.slug || item2.url_name || item2.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 
-                const type = item1.content_type;
-                const compareUrl = `https://nanoreview.net/en/${type}-compare/${slug1}-vs-${slug2}`;
-
+                const compareUrl = `https://nanoreview.net/en/${item1.content_type}-compare/${slug1}-vs-${slug2}`;
                 const data = await scrapeComparePage(context, compareUrl);
                 return reply.send({ success: true, contentType: 'comparison', data });
             });
@@ -83,7 +81,6 @@ export const setupRoutes = (fastify) => {
         }
     });
 
-    // ── /api/suggestions ──────────────────────────────────────────────────────
     fastify.get('/api/suggestions', async (req, reply) => {
         const { q } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
@@ -110,7 +107,6 @@ export const setupRoutes = (fastify) => {
         }
     });
 
-    // ── /api/rankings ─────────────────────────────────────────────────────────
     fastify.get('/api/rankings', async (req, reply) => {
         const { type } = req.query;
         if (!type) return reply.status(400).send({ success: false, error: 'Query parameter "type" is required' });
