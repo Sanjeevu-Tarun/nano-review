@@ -2,18 +2,16 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { setupRoutes } from '../routes.js';
 
-let app = null;
+const fastify = Fastify({ logger: true });
 
-async function getApp() {
-    if (app) return app;
-    app = Fastify({ logger: false });
-    await app.register(cors, { origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] });
-    setupRoutes(app);
-    await app.ready();
-    return app;
-}
+fastify.register(cors, {
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+});
+
+setupRoutes(fastify);
 
 export default async function handler(req, res) {
-    const fastify = await getApp();
+    await fastify.ready();
     fastify.server.emit('request', req, res);
 }
