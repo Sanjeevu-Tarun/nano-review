@@ -3,7 +3,7 @@ services:
     name: nanoreview-api
     env: node
     plan: free
-    buildCommand: npm install && npx playwright install chromium --with-deps
+    buildCommand: npm install && npx playwright install chromium
     startCommand: node server.js
     healthCheckPath: /health
     envVars:
@@ -11,3 +11,5 @@ services:
         value: production
       - key: PORT
         value: 3000
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/.playwright
