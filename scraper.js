@@ -1,10 +1,78 @@
 import * as cheerio from 'cheerio';
-import { waitForCloudflare, safeNavigate } from './browser.js';
+import { waitForCloudflare, safeNavigate, acquireContext } from './browser.js';
 
 const searchCache = new Map();
 const CACHE_TTL = 300000;
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+// ─── Persistent search page ───────────────────────────────────────────────────
+// We keep ONE browser page permanently parked on nanoreview.net after solving CF.
+// All search API calls run via page.evaluate() on this page — no re-navigation.
+let searchPage = null;
+let searchPageReady = false;
+let searchPageInitPromise = null;
+
+const initSearchPage = async () => {
+    if (searchPageInitPromise) return searchPageInitPromise;
+
+    searchPageInitPromise = (async () => {
+        const entry = await acquireContext();
+        const page = await entry.context.newPage();
+
+        await page.route('**/*', (route) => {
+            const t = route.request().resourceType();
+            if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
+            else route.continue();
+        });
+
+        await safeNavigate(page, 'https://nanoreview.net/en/', { timeout: 30000 });
+        await waitForCloudflare(page, 'body', 30000);
+
+        // Verify we actually passed CF
+        const title = await page.title();
+        if (/just a moment/i.test(title)) {
+            searchPage = null;
+            searchPageReady = false;
+            searchPageInitPromise = null;
+            throw new Error('CF challenge not solved');
+        }
+
+        searchPage = page;
+        searchPageReady = true;
+        console.log('[SearchPage] Ready, title:', title);
+
+        // Reset if page crashes or closes
+        page.on('close', () => { searchPage = null; searchPageReady = false; searchPageInitPromise = null; });
+        page.on('crash', () => { searchPage = null; searchPageReady = false; searchPageInitPromise = null; });
+    })();
+
+    return searchPageInitPromise;
+};
+
+const getSearchPage = async () => {
+    if (searchPageReady && searchPage) return searchPage;
+    searchPageInitPromise = null; // force re-init
+    await initSearchPage();
+    return searchPage;
+};
+
+// Run fetch() calls from inside the real Chrome context (bypasses CF IP block)
+const searchViaPage = async (query, limit, types) => {
+    const page = await getSearchPage();
+
+    return page.evaluate(async ({ query, limit, types }) => {
+        const results = [];
+        await Promise.all(types.map(async (type) => {
+            try {
+                const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
+                const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+                if (!r.ok) return;
+                const data = await r.json();
+                if (Array.isArray(data)) data.forEach(d => results.push({ ...d, content_type: d.content_type || type }));
+            } catch {}
+        }));
+        return results;
+    }, { query, limit, types });
+};
 
 // ─── Type detection ───────────────────────────────────────────────────────────
 const detectLikelyTypes = (query) => {
@@ -23,36 +91,16 @@ const detectLikelyTypes = (query) => {
     return allTypes;
 };
 
-// ─── Search — direct Node fetch, no Playwright needed ────────────────────────
-// The debug confirmed nanoreview's /api/search endpoint is open (no CF/cookies).
+// ─── Search ───────────────────────────────────────────────────────────────────
 export const searchDevices = async (_context, query, limit = 5) => {
     const cacheKey = `${query.toLowerCase()}-${limit}`;
     const cached = searchCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) return cached.results;
 
     const types = detectLikelyTypes(query);
+    const allResults = await searchViaPage(query, limit, types);
 
-    const fetchPromises = types.map(async (type) => {
-        try {
-            const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
-            const res = await fetch(url, {
-                headers: {
-                    'Accept': 'application/json',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'User-Agent': UA,
-                    'Referer': 'https://nanoreview.net/en/',
-                },
-            });
-            if (!res.ok) return [];
-            const data = await res.json();
-            return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
-        } catch {
-            return [];
-        }
-    });
-
-    const allResults = (await Promise.all(fetchPromises)).flat();
-    if (allResults.length === 0) return [];
+    if (!allResults || allResults.length === 0) return [];
 
     const scoreMatch = (name, q) => {
         const n = name.toLowerCase(), ql = q.toLowerCase();
@@ -99,7 +147,7 @@ const extractImages = ($) => {
     return [...new Set(images)];
 };
 
-// ─── Scrape a page (needs Playwright for JS-rendered content) ────────────────
+// ─── Scrape a page (new page per scrape, reuses browser context) ──────────────
 const scrapePage = async (context, url) => {
     const page = await context.newPage();
     try {
@@ -121,25 +169,14 @@ const scrapePage = async (context, url) => {
 export const scrapeDevicePage = async (context, deviceUrl) => {
     const html = await scrapePage(context, deviceUrl);
     const $ = cheerio.load(html);
-    const data = {
-        title: $('h1').text().trim(),
-        sourceUrl: deviceUrl,
-        images: extractImages($),
-        scores: {}, pros: [], cons: [], specs: {},
-    };
+    const data = { title: $('h1').text().trim(), sourceUrl: deviceUrl, images: extractImages($), scores: {}, pros: [], cons: [], specs: {} };
     $('[class*="score"], .progress-bar, .rating-box').each((_, el) => {
-        const label = $(el).find('[class*="title"], [class*="name"]').first().text().trim()
-            || $(el).prev('div, p, span').text().trim();
-        const value = $(el).find('[class*="value"], [class*="num"]').first().text().trim()
-            || $(el).text().replace(/[^0-9]/g, '').trim();
+        const label = $(el).find('[class*="title"], [class*="name"]').first().text().trim() || $(el).prev('div, p, span').text().trim();
+        const value = $(el).find('[class*="value"], [class*="num"]').first().text().trim() || $(el).text().replace(/[^0-9]/g, '').trim();
         if (label && value && label !== value) data.scores[label] = value;
     });
-    $('[class*="pros"] li, [class*="plus"] li, .green li').each((_, el) => {
-        const t = $(el).text().trim(); if (t) data.pros.push(t);
-    });
-    $('[class*="cons"] li, [class*="minus"] li, .red li').each((_, el) => {
-        const t = $(el).text().trim(); if (t) data.cons.push(t);
-    });
+    $('[class*="pros"] li, [class*="plus"] li, .green li').each((_, el) => { const t = $(el).text().trim(); if (t) data.pros.push(t); });
+    $('[class*="cons"] li, [class*="minus"] li, .red li').each((_, el) => { const t = $(el).text().trim(); if (t) data.cons.push(t); });
     $('.card, .box, section, [class*="specs"]').each((_, card) => {
         const sectionTitle = $(card).find('.card-header, .card-title, h2, h3').first().text().trim() || 'Details';
         const section = {};
@@ -160,12 +197,7 @@ export const scrapeDevicePage = async (context, deviceUrl) => {
 export const scrapeComparePage = async (context, compareUrl) => {
     const html = await scrapePage(context, compareUrl);
     const $ = cheerio.load(html);
-    const data = {
-        title: $('h1').text().trim(), sourceUrl: compareUrl,
-        images: extractImages($),
-        device1: { name: '', score: '' }, device2: { name: '', score: '' },
-        comparisons: {},
-    };
+    const data = { title: $('h1').text().trim(), sourceUrl: compareUrl, images: extractImages($), device1: { name: '', score: '' }, device2: { name: '', score: '' }, comparisons: {} };
     const headers = [];
     $('.compare-header [class*="title"], .vs-header h2, th').each((_, el) => {
         const text = $(el).text().trim();
