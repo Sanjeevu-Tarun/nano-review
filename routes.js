@@ -1,8 +1,6 @@
 import { searchDevices, scrapeDevicePage, scrapeComparePage, scrapeRankingPage } from './scraper.js';
 import { acquireContext } from './browser.js';
 
-// Wraps every route: acquires a pooled context, runs fn, releases it back.
-// "release" returns the context to the pool instead of destroying the browser.
 const withContext = async (fn) => {
     const entry = await acquireContext();
     try {
@@ -14,6 +12,64 @@ const withContext = async (fn) => {
 
 export const setupRoutes = (fastify) => {
 
+    // ── /api/debug ────────────────────────────────────────────────────────────
+    // Call: /api/debug?q=iPhone+16+Pro
+    // Returns raw API responses for each type so you can see exactly what
+    // nanoreview returns (or doesn't) for any query.
+    fastify.get('/api/debug', async (req, reply) => {
+        const { q } = req.query;
+        if (!q) return reply.status(400).send({ error: 'q required' });
+
+        let entry;
+        try {
+            entry = await acquireContext();
+            const context = entry.context;
+            const page = await context.newPage();
+
+            try {
+                await page.route('**/*', (route) => {
+                    const t = route.request().resourceType();
+                    if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
+                    else route.continue();
+                });
+
+                await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+                const pageInfo = {
+                    title: await page.title().catch(() => '?'),
+                    url: await page.url().catch(() => '?'),
+                };
+
+                const allTypes = ['phone', 'tablet', 'laptop', 'soc', 'cpu', 'gpu'];
+                const typeResults = await page.evaluate(async ({ query, types }) => {
+                    const out = {};
+                    await Promise.all(types.map(async (type) => {
+                        try {
+                            const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=5&type=${type}`;
+                            const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+                            const text = await r.text();
+                            let parsed;
+                            try { parsed = JSON.parse(text); } catch { parsed = text.slice(0, 200); }
+                            out[type] = { status: r.status, data: parsed };
+                        } catch (e) {
+                            out[type] = { error: e.message };
+                        }
+                    }));
+                    return out;
+                }, { query: q, types: allTypes });
+
+                return reply.send({ pageInfo, query: q, typeResults });
+            } finally {
+                await page.close();
+            }
+        } catch (err) {
+            return reply.status(500).send({ error: err.message });
+        } finally {
+            if (entry) entry.release();
+        }
+    });
+
+    // ── /api/search ───────────────────────────────────────────────────────────
     fastify.get('/api/search', async (req, reply) => {
         const { q, index } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
@@ -51,13 +107,13 @@ export const setupRoutes = (fastify) => {
         }
     });
 
+    // ── /api/compare ──────────────────────────────────────────────────────────
     fastify.get('/api/compare', async (req, reply) => {
         const { q1, q2 } = req.query;
         if (!q1 || !q2) return reply.status(400).send({ success: false, error: 'Parameters "q1" and "q2" are required' });
 
         try {
             return await withContext(async (context) => {
-                // Search both devices in parallel
                 const [results1, results2] = await Promise.all([
                     searchDevices(context, q1, 3),
                     searchDevices(context, q2, 3),
@@ -81,6 +137,7 @@ export const setupRoutes = (fastify) => {
         }
     });
 
+    // ── /api/suggestions ──────────────────────────────────────────────────────
     fastify.get('/api/suggestions', async (req, reply) => {
         const { q } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: 'Query parameter "q" is required' });
@@ -107,6 +164,7 @@ export const setupRoutes = (fastify) => {
         }
     });
 
+    // ── /api/rankings ─────────────────────────────────────────────────────────
     fastify.get('/api/rankings', async (req, reply) => {
         const { type } = req.query;
         if (!type) return reply.status(400).send({ success: false, error: 'Query parameter "type" is required' });
