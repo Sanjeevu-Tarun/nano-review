@@ -13,60 +13,40 @@ const withContext = async (fn) => {
 export const setupRoutes = (fastify) => {
 
     // ── /api/debug ────────────────────────────────────────────────────────────
-    // Call: /api/debug?q=iPhone+16+Pro
-    // Returns raw API responses for each type so you can see exactly what
-    // nanoreview returns (or doesn't) for any query.
     fastify.get('/api/debug', async (req, reply) => {
         const { q } = req.query;
         if (!q) return reply.status(400).send({ error: 'q required' });
-
-        let entry;
         try {
-            entry = await acquireContext();
-            const context = entry.context;
-            const page = await context.newPage();
-
-            try {
-                await page.route('**/*', (route) => {
-                    const t = route.request().resourceType();
-                    if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
-                    else route.continue();
-                });
-
-                await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-                const pageInfo = {
-                    title: await page.title().catch(() => '?'),
-                    url: page.url(),
-                };
-
-                const allTypes = ['phone', 'tablet', 'laptop', 'soc', 'cpu', 'gpu'];
-                const typeResults = await page.evaluate(async ({ query, types }) => {
-                    const out = {};
-                    await Promise.all(types.map(async (type) => {
-                        try {
-                            const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=5&type=${type}`;
-                            const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
-                            const text = await r.text();
-                            let parsed;
-                            try { parsed = JSON.parse(text); } catch { parsed = text.slice(0, 200); }
-                            out[type] = { status: r.status, data: parsed };
-                        } catch (e) {
-                            out[type] = { error: e.message };
-                        }
-                    }));
-                    return out;
-                }, { query: q, types: allTypes });
-
-                return reply.send({ pageInfo, query: q, typeResults });
-            } finally {
-                await page.close();
-            }
-        } catch (err) {
-            return reply.status(500).send({ error: err.message });
-        } finally {
-            if (entry) entry.release();
-        }
+            return await withContext(async (context) => {
+                const page = await context.newPage();
+                try {
+                    await page.route('**/*', (route) => {
+                        const t = route.request().resourceType();
+                        if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
+                        else route.continue();
+                    });
+                    await page.goto('https://nanoreview.net/en/', { waitUntil: 'networkidle', timeout: 30000 });
+                    const pageInfo = { title: await page.title().catch(() => '?'), url: page.url() };
+                    const cookies = await context.cookies('https://nanoreview.net');
+                    const cookieSummary = cookies.map(c => c.name).join(', ');
+                    const allTypes = ['phone', 'tablet', 'laptop', 'soc', 'cpu', 'gpu'];
+                    const typeResults = await page.evaluate(async ({ query, types }) => {
+                        const out = {};
+                        await Promise.all(types.map(async (type) => {
+                            try {
+                                const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=3&type=${type}`;
+                                const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+                                const text = await r.text();
+                                let parsed; try { parsed = JSON.parse(text); } catch { parsed = text.slice(0, 200); }
+                                out[type] = { status: r.status, count: Array.isArray(parsed) ? parsed.length : 'n/a', data: parsed };
+                            } catch (e) { out[type] = { error: e.message }; }
+                        }));
+                        return out;
+                    }, { query: q, types: allTypes });
+                    return reply.send({ pageInfo, cookies: cookieSummary, query: q, typeResults });
+                } finally { await page.close(); }
+            });
+        } catch (err) { return reply.status(500).send({ error: err.message }); }
     });
 
     // ── /api/search ───────────────────────────────────────────────────────────
