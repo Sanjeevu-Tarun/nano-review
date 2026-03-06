@@ -1,76 +1,10 @@
 import * as cheerio from 'cheerio';
-import { waitForCloudflare, safeNavigate, acquireContext } from './browser.js';
+import { waitForCloudflare, safeNavigate } from './browser.js';
 
 const searchCache = new Map();
 const CACHE_TTL = 300000;
 
-// ─── CF Cookie Store ──────────────────────────────────────────────────────────
-// After solving CF once, store cookies + user-agent for reuse in plain fetch().
-// This avoids opening a new browser page for every search.
-let cfCookies = null;       // string like "cf_clearance=xxx; __cf_bm=yyy"
-let cfUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-let cfCookieExpiry = 0;
-const CF_COOKIE_TTL = 20 * 60 * 1000; // 20 minutes
-
-const solveCFAndExtractCookies = async () => {
-    const entry = await acquireContext();
-    const page = await entry.context.newPage();
-    try {
-        await page.route('**/*', (route) => {
-            const t = route.request().resourceType();
-            if (['font', 'media', 'image'].includes(t)) route.abort();
-            else route.continue();
-        });
-        await safeNavigate(page, 'https://nanoreview.net/en/', { timeout: 30000 });
-        await waitForCloudflare(page, 'body', 30000);
-
-        // Extract cookies from browser context
-        const cookies = await entry.context.cookies('https://nanoreview.net');
-        cfCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-        cfUserAgent = await page.evaluate(() => navigator.userAgent);
-        cfCookieExpiry = Date.now() + CF_COOKIE_TTL;
-        console.log('[CF] Cookies solved and stored:', cfCookies.slice(0, 80));
-    } finally {
-        await page.close();
-        entry.release();
-    }
-};
-
-const ensureCFCookies = async () => {
-    if (cfCookies && Date.now() < cfCookieExpiry) return;
-    try {
-        await solveCFAndExtractCookies();
-    } catch (e) {
-        console.log('[CF] Cookie solving failed (non-fatal):', e.message);
-        // Set a dummy non-null value so we don't retry on every request
-        cfCookies = cfCookies || '';
-        cfCookieExpiry = Date.now() + 60000; // retry after 1 min
-    }
-};
-
-// ─── Lightweight node fetch (no browser page needed) ─────────────────────────
-const fetchWithCF = async (url) => {
-    await ensureCFCookies();
-    const headers = {
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'User-Agent': cfUserAgent,
-        'Referer': 'https://nanoreview.net/en/',
-        'X-Requested-With': 'XMLHttpRequest',
-    };
-    if (cfCookies) headers['Cookie'] = cfCookies;
-
-    const res = await fetch(url, { headers });
-    // If CF blocks, try re-solving once
-    if (res.status === 403 || res.status === 429) {
-        console.log(`[CF] Got ${res.status}, re-solving...`);
-        cfCookies = null;
-        try { await solveCFAndExtractCookies(); } catch {}
-        if (cfCookies) headers['Cookie'] = cfCookies;
-        return fetch(url, { headers });
-    }
-    return res;
-};
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 // ─── Type detection ───────────────────────────────────────────────────────────
 const detectLikelyTypes = (query) => {
@@ -89,7 +23,8 @@ const detectLikelyTypes = (query) => {
     return allTypes;
 };
 
-// ─── Search — pure Node fetch, no browser page ────────────────────────────────
+// ─── Search — direct Node fetch, no Playwright needed ────────────────────────
+// The debug confirmed nanoreview's /api/search endpoint is open (no CF/cookies).
 export const searchDevices = async (_context, query, limit = 5) => {
     const cacheKey = `${query.toLowerCase()}-${limit}`;
     const cached = searchCache.get(cacheKey);
@@ -97,11 +32,17 @@ export const searchDevices = async (_context, query, limit = 5) => {
 
     const types = detectLikelyTypes(query);
 
-    // Fire all type searches in parallel using plain Node fetch (fast!)
     const fetchPromises = types.map(async (type) => {
         try {
             const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
-            const res = await fetchWithCF(url);
+            const res = await fetch(url, {
+                headers: {
+                    'Accept': 'application/json',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'User-Agent': UA,
+                    'Referer': 'https://nanoreview.net/en/',
+                },
+            });
             if (!res.ok) return [];
             const data = await res.json();
             return Array.isArray(data) ? data.map(r => ({ ...r, content_type: r.content_type || type })) : [];
@@ -110,14 +51,11 @@ export const searchDevices = async (_context, query, limit = 5) => {
         }
     });
 
-    const resultsArrays = await Promise.all(fetchPromises);
-    const allResults = resultsArrays.flat();
-
+    const allResults = (await Promise.all(fetchPromises)).flat();
     if (allResults.length === 0) return [];
 
     const scoreMatch = (name, q) => {
-        const n = name.toLowerCase();
-        const ql = q.toLowerCase();
+        const n = name.toLowerCase(), ql = q.toLowerCase();
         if (n === ql) return 1000;
         if (n.includes(ql)) return 500;
         let score = 0;
@@ -126,10 +64,8 @@ export const searchDevices = async (_context, query, limit = 5) => {
     };
 
     allResults.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
-
     searchCache.set(cacheKey, { results: allResults, timestamp: Date.now() });
     if (searchCache.size > 100) searchCache.delete(searchCache.keys().next().value);
-
     return allResults;
 };
 
@@ -163,7 +99,7 @@ const extractImages = ($) => {
     return [...new Set(images)];
 };
 
-// ─── Scrape a page using browser (needed for JS-rendered content) ─────────────
+// ─── Scrape a page (needs Playwright for JS-rendered content) ────────────────
 const scrapePage = async (context, url) => {
     const page = await context.newPage();
     try {
@@ -173,6 +109,7 @@ const scrapePage = async (context, url) => {
             else route.continue();
         });
         await safeNavigate(page, url, { timeout: 30000 });
+        await waitForCloudflare(page, 'body', 30000);
         await page.waitForTimeout(800);
         return await page.content();
     } finally {
@@ -191,12 +128,18 @@ export const scrapeDevicePage = async (context, deviceUrl) => {
         scores: {}, pros: [], cons: [], specs: {},
     };
     $('[class*="score"], .progress-bar, .rating-box').each((_, el) => {
-        const label = $(el).find('[class*="title"], [class*="name"]').first().text().trim() || $(el).prev('div, p, span').text().trim();
-        const value = $(el).find('[class*="value"], [class*="num"]').first().text().trim() || $(el).text().replace(/[^0-9]/g, '').trim();
+        const label = $(el).find('[class*="title"], [class*="name"]').first().text().trim()
+            || $(el).prev('div, p, span').text().trim();
+        const value = $(el).find('[class*="value"], [class*="num"]').first().text().trim()
+            || $(el).text().replace(/[^0-9]/g, '').trim();
         if (label && value && label !== value) data.scores[label] = value;
     });
-    $('[class*="pros"] li, [class*="plus"] li, .green li').each((_, el) => { const t = $(el).text().trim(); if (t) data.pros.push(t); });
-    $('[class*="cons"] li, [class*="minus"] li, .red li').each((_, el) => { const t = $(el).text().trim(); if (t) data.cons.push(t); });
+    $('[class*="pros"] li, [class*="plus"] li, .green li').each((_, el) => {
+        const t = $(el).text().trim(); if (t) data.pros.push(t);
+    });
+    $('[class*="cons"] li, [class*="minus"] li, .red li').each((_, el) => {
+        const t = $(el).text().trim(); if (t) data.cons.push(t);
+    });
     $('.card, .box, section, [class*="specs"]').each((_, card) => {
         const sectionTitle = $(card).find('.card-header, .card-title, h2, h3').first().text().trim() || 'Details';
         const section = {};
