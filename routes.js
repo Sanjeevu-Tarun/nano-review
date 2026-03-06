@@ -37,7 +37,7 @@ export const setupRoutes = (fastify) => {
 
                 const pageInfo = {
                     title: await page.title().catch(() => '?'),
-                    url: await page.url().catch(() => '?'),
+                    url: page.url(),
                 };
 
                 const allTypes = ['phone', 'tablet', 'laptop', 'soc', 'cpu', 'gpu'];

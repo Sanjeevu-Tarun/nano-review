@@ -122,7 +122,7 @@ export const waitForCloudflare = async (page, selector, timeout = 20000) => {
     while (Date.now() - start < timeout) {
         try {
             const title = await page.title().catch(() => '');
-            const url = await page.url().catch(() => '');
+            const url = page.url();
             const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
             const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
 
