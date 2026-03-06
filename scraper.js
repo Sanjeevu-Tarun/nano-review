@@ -13,7 +13,7 @@ const detectLikelyTypes = (query) => {
     if (/nvidia|rtx|gtx|radeon|rx\s*[0-9]|geforce|quadro|vega|arc\s*a[0-9]/i.test(q)) {
         return ['gpu', 'laptop', 'cpu', 'phone', 'tablet', 'soc'];
     }
-    if (/iphone|galaxy|pixel|oneplus|xiaomi|oppo|vivo|realme|nothing\s*phone|asus\s*rog\s*phone/i.test(q)) {
+    if (/iphone|galaxy|pixel|oneplus|xiaomi|oppo|vivo|realme|nothing\s*phone|asus\s*rog\s*phone|redmi|poco|iqoo|nokia|motorola|moto\s*g|moto\s*e|sony\s*xperia|xperia|huawei|honor|infinix|tecno|itel|lava|micromax|zte|nubia|meizu|blackview|ulefone|doogee|oukitel|cubot|umidigi|wiko|alcatel|cat\s*s|agm|kyocera|sharp\s*aquos|aquos|fujitsu\s*arrows|arrows|samsung\s*[a-z][0-9]|[a-z]\s*series|fold|flip\s*[0-9]|civi|note\s*[0-9]|ultra|pro\s*max|pro\s*plus|\bx[0-9]|\bs[0-9]|\ba[0-9]|\bf[0-9]|\bc[0-9]/i.test(q)) {
         return ['phone', 'soc', 'tablet', 'laptop', 'cpu', 'gpu'];
     }
     if (/ipad|galaxy\s*tab|surface|tab\s*s[0-9]/i.test(q)) {
@@ -56,7 +56,7 @@ export const searchDevices = async (context, query, limit = 5) => {
                 try {
                     const url = `https://nanoreview.net/api/search?q=${encodeURIComponent(query)}&limit=${limit}&type=${type}`;
                     const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 2000);
+                    const timeoutId = setTimeout(() => controller.abort(), 8000);
                     const response = await fetch(url, { signal: controller.signal, headers: { 'Accept': 'application/json' } });
                     clearTimeout(timeoutId);
                     if (!response.ok) return [];
