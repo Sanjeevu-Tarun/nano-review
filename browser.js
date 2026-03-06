@@ -115,48 +115,48 @@ export const acquireContext = async () => {
 
 // ─── Original helpers — UNCHANGED, used by scraper.js ────────────────────────
 
-export const waitForCloudflare = async (page, selector, timeout = 20000) => {
+export const waitForCloudflare = async (page, selector, timeout = 30000) => {
     const start = Date.now();
-    let lastError;
 
+    // Wait for CF challenge to fully resolve — keep polling until the title
+    // is no longer a CF challenge page and the URL is stable on the real site.
     while (Date.now() - start < timeout) {
         try {
             const title = await page.title().catch(() => '');
             const url = page.url();
-            const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
-            const isChallengeUrl = /cdn-cgi|challenge-platform/i.test(url);
 
-            if (!isChallenge && !isChallengeUrl) {
-                try {
-                    await page.waitForSelector(selector, { timeout: 2000, state: 'attached' });
-                    return true;
-                } catch {
-                    const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
-                    if (hasContent) return true;
-                }
+            const isChallenge =
+                /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title) ||
+                /cdn-cgi|challenge-platform|__cf_chl/i.test(url);
+
+            if (!isChallenge) {
+                // Real page loaded — confirm it has actual content
+                const hasContent = await page.evaluate(() =>
+                    document.body && document.body.innerHTML.length > 500
+                ).catch(() => false);
+
+                if (hasContent) return true;
             }
 
-            await page.waitForTimeout(1000);
-        } catch (error) {
-            lastError = error;
-            await page.waitForTimeout(1000);
+            // Still on CF challenge — wait and let the JS challenge run
+            await page.waitForTimeout(1500);
+        } catch {
+            await page.waitForTimeout(1500);
         }
     }
 
-    try {
-        const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
-        if (hasContent) return true;
-    } catch {}
-
-    throw new Error(`Cloudflare timeout after ${timeout}ms: ${lastError?.message || 'Unknown error'}`);
+    throw new Error(`Cloudflare challenge did not resolve within ${timeout}ms`);
 };
 
 export const safeNavigate = async (page, url, options = {}) => {
-    const defaultOptions = { waitUntil: 'domcontentloaded', timeout: 25000 };
+    // Use 'networkidle' so Cloudflare's JS challenge has time to complete
+    // before we try to interact with the page. Fall back gracefully on timeout.
+    const defaultOptions = { waitUntil: 'networkidle', timeout: 30000 };
     try {
         await page.goto(url, { ...defaultOptions, ...options });
         return true;
     } catch (error) {
+        // Timeout on networkidle is common and usually fine — page has content
         try {
             const hasContent = await page.evaluate(() => document.body && document.body.innerHTML.length > 100);
             if (hasContent) return true;

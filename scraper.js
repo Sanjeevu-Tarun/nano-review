@@ -40,7 +40,7 @@ export const searchDevices = async (context, query, limit = 5) => {
             else route.continue();
         });
 
-        await safeNavigate(page, 'https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await safeNavigate(page, 'https://nanoreview.net/en/', { timeout: 30000 });
 
         // Wait for page to be ready, but don't wait too long
         try {
@@ -108,7 +108,7 @@ export const scrapeDevicePage = async (context, deviceUrl) => {
             else route.continue();
         });
 
-        await safeNavigate(page, deviceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await safeNavigate(page, deviceUrl, { timeout: 30000 });
 
         // Wait for content to be available
         await page.waitForTimeout(1000);
@@ -203,7 +203,7 @@ export const scrapeComparePage = async (context, compareUrl) => {
             else route.continue();
         });
 
-        await safeNavigate(page, compareUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await safeNavigate(page, compareUrl, { timeout: 30000 });
 
         // Wait for content to be available
         await page.waitForTimeout(1000);
@@ -298,7 +298,7 @@ export const scrapeRankingPage = async (context, rankingUrl) => {
             else route.continue();
         });
 
-        await safeNavigate(page, rankingUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await safeNavigate(page, rankingUrl, { timeout: 30000 });
 
         // Wait for content to be available
         await page.waitForTimeout(1000);
