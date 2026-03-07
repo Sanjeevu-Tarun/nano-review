@@ -1,6 +1,10 @@
 import { chromium } from 'playwright';
 
-// ─── Single persistent browser ────────────────────────────────────────────────
+
+// Force Playwright to use a local browser path inside the project
+// This ensures the browser installed during build is found at runtime
+process.env.PLAYWRIGHT_BROWSERS_PATH = '/opt/render/project/src/.browsers';
+
 let _browser = null;
 let _launchPromise = null;
 
@@ -25,10 +29,8 @@ const getBrowser = async () => {
     return _launchPromise;
 };
 
-// ─── getBrowserContext — SAME signature as original, persistent browser ────────
 export const getBrowserContext = async () => {
     const browser = await getBrowser();
-
     const context = await browser.newContext({
         viewport: { width: 1280, height: 720 },
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -54,15 +56,11 @@ export const getBrowserContext = async () => {
     });
 
     return {
-        browser: {
-            // routes.js calls browser.close() — we close context but keep browser alive
-            close: async () => { await context.close().catch(() => {}); }
-        },
+        browser: { close: async () => { await context.close().catch(() => {}); } },
         context
     };
 };
 
-// ─── waitForCloudflare and safeNavigate — IDENTICAL to original ───────────────
 export const waitForCloudflare = async (page, selector, timeout = 20000) => {
     const start = Date.now();
     let lastError;
