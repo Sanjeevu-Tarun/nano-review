@@ -1,4 +1,4 @@
-import { searchAndScrape, scrapeDevicePage, scrapeComparePage, scrapeRankingPage, searchDevicesDirect } from './scraper.js';
+import { searchAndScrape, scrapeComparePage, scrapeRankingPage, searchDevicesDirect } from './scraper.js';
 import { getBrowserContext } from './browser.js';
 
 export const setupRoutes = (fastify) => {
