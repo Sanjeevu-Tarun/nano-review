@@ -1,7 +1,6 @@
 import { searchAndScrape, searchSuggestions, scrapeComparePage, scrapeRankingPage } from './scraper.js';
 
 export const setupRoutes = (fastify) => {
-
     fastify.get('/api/search', async (req, reply) => {
         const { q, index } = req.query;
         if (!q) return reply.status(400).send({ success: false, error: '"q" required' });
@@ -37,7 +36,7 @@ export const setupRoutes = (fastify) => {
             return reply.send({ success: true, data: results.map((r, i) => ({
                 index: i, name: r.name, type: r.content_type,
                 slug: r.slug || r.url_name,
-                url: `https://nanoreview.net/en/${r.content_type}/${r.slug || r.url_name}`
+                url: `https://nanoreview.net/en/${r.content_type}/${r.slug||r.url_name}`
             }))});
         } catch (e) {
             return reply.status(500).send({ success: false, error: e.message });
@@ -55,8 +54,7 @@ export const setupRoutes = (fastify) => {
         };
         if (!urls[type]) return reply.status(400).send({ success: false, error: 'Invalid type' });
         try {
-            const data = await scrapeRankingPage(urls[type]);
-            return reply.send({ success: true, contentType: 'rankings', data });
+            return reply.send({ success: true, data: await scrapeRankingPage(urls[type]) });
         } catch (e) {
             return reply.status(500).send({ success: false, error: e.message });
         }

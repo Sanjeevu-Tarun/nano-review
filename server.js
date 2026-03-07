@@ -21,10 +21,9 @@ const port = parseInt(process.env.PORT || '3000', 10);
 await fastify.listen({ port, host: '0.0.0.0' });
 console.log(`Server live on port ${port}`);
 
-// CF warmup first, then prewarm popular devices
 warmupCF()
     .then(() => prewarmPopular())
+    .then(() => console.log('[startup] fully ready ✓'))
     .catch(e => console.error('[startup error]', e.message));
 
-// Re-solve CF every 5 min
 setInterval(() => warmupCF().catch(e => console.error('[rewarm]', e.message)), 5 * 60 * 1000);
