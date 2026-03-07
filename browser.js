@@ -1,8 +1,4 @@
-import { chromium } from 'playwright';
-
-
-// Force Playwright to use a local browser path inside the project
-// This ensures the browser installed during build is found at runtime
+import { chromium } from 'playwright-chromium';
 
 let _browser = null;
 let _launchPromise = null;

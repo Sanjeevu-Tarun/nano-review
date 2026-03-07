@@ -3,8 +3,8 @@ services:
     name: nanoreview-api
     env: node
     plan: free
-    buildCommand: npm install && PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.browsers npx playwright install chromium
-    startCommand: bash start.sh
+    buildCommand: npm install
+    startCommand: node server.js
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
