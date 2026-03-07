@@ -1,10 +1,8 @@
 services:
   - type: web
     name: nanoreview-api
-    env: node
+    env: docker
     plan: free
-    buildCommand: npm install
-    startCommand: node server.js
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV

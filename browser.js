@@ -1,4 +1,4 @@
-import { chromium } from 'playwright-chromium';
+import { chromium } from 'playwright';
 
 let _browser = null;
 let _launchPromise = null;
