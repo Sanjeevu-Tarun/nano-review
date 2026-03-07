@@ -1,8 +1,5 @@
 import * as cheerio from 'cheerio';
-
-const searchCache = new Map();
-const deviceCache = new Map();
-const CACHE_TTL = 300000;
+import { cacheGet, cacheSet } from './cache.js';
 
 const detectLikelyTypes = (query) => {
     const q = query.toLowerCase();
@@ -24,7 +21,6 @@ const scoreMatch = (name, q) => {
     return score - n.length * 0.1;
 };
 
-// Run search API calls from nanoreview homepage (needed for correct origin/cookies)
 const runSearchFetches = async (page, query, limit, types) => {
     return page.evaluate(async ({ query, limit, types }) => {
         const promises = types.map(async (type) => {
@@ -40,122 +36,6 @@ const runSearchFetches = async (page, query, limit, types) => {
         });
         return (await Promise.all(promises)).flat();
     }, { query, limit, types });
-};
-
-// THE KEY OPTIMIZATION: search + scrape in ONE page object
-// Page 1: goto homepage → fire all search fetches in parallel → get results
-// Then: reuse SAME page, goto device page → scrape
-// Result: 1 page, 2 navigations (was previously 2 pages, 2 navigations + CF solve each)
-export const searchAndScrape = async (context, query, index) => {
-    const cacheKey = `${query.toLowerCase()}-${index ?? 'top'}`;
-    const cached = deviceCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL) return cached;
-
-    const types = detectLikelyTypes(query);
-    const page = await context.newPage();
-
-    try {
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            if (['font', 'media', 'image', 'stylesheet'].includes(type)) route.abort();
-            else route.continue();
-        });
-
-        // Navigation 1: homepage (needed for CF origin + cookies)
-        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-        // Fire all type searches in parallel from this page
-        const searchResults = await runSearchFetches(page, query, 5, types);
-
-        if (!searchResults.length) return null;
-
-        searchResults.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
-
-        // Cache the search results
-        const sk = `${query.toLowerCase()}-5`;
-        if (!searchCache.has(sk)) searchCache.set(sk, { results: searchResults, timestamp: Date.now() });
-
-        let item;
-        if (index !== undefined) {
-            item = searchResults[Math.min(parseInt(index, 10) || 0, searchResults.length - 1)];
-        } else {
-            item = searchResults.find(r => r.name.toLowerCase() === query.toLowerCase()) || searchResults[0];
-        }
-
-        const slug = item.slug || item.url_name || item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-        const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${slug}`;
-
-        // Navigation 2: device page — reusing the SAME page (no new page creation)
-        await page.goto(deviceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        const html = await page.content();
-        const $ = cheerio.load(html);
-
-        const data = {
-            title: $('h1').text().trim(),
-            sourceUrl: deviceUrl,
-            images: extractImages($),
-            scores: {},
-            pros: [],
-            cons: [],
-            specs: {},
-            matchedQuery: query,
-            searchResults: searchResults.map((r, i) => ({
-                index: i, name: r.name, type: r.content_type, slug: r.slug || r.url_name,
-            })),
-        };
-
-        $('[class*="score"], .progress-bar, .rating-box').each((_, el) => {
-            const label = $(el).find('[class*="title"], [class*="name"]').first().text().trim() || $(el).prev('div, p, span').text().trim();
-            const value = $(el).find('[class*="value"], [class*="num"]').first().text().trim() || $(el).text().replace(/[^0-9]/g, '').trim();
-            if (label && value && label !== value) data.scores[label] = value;
-        });
-        $('[class*="pros"] li, [class*="plus"] li, .green li').each((_, el) => { const t = $(el).text().trim(); if (t) data.pros.push(t); });
-        $('[class*="cons"] li, [class*="minus"] li, .red li').each((_, el) => { const t = $(el).text().trim(); if (t) data.cons.push(t); });
-        $('.card, .box, section, [class*="specs"]').each((_, card) => {
-            const st = $(card).find('.card-header, .card-title, h2, h3').first().text().trim() || 'Details';
-            const section = {};
-            $(card).find('table tr').each((__, row) => {
-                const cells = $(row).find('td, th');
-                if (cells.length >= 2) {
-                    const label = cells.first().text().trim().replace(/:$/, '');
-                    const value = cells.last().text().trim();
-                    if (label && value && label !== value) section[label] = value;
-                }
-            });
-            if (Object.keys(section).length > 0) data.specs[st] = section;
-        });
-
-        const result = { data, searchResults };
-        deviceCache.set(cacheKey, { ...result, timestamp: Date.now() });
-        if (deviceCache.size > 50) deviceCache.delete(deviceCache.keys().next().value);
-        return result;
-    } finally {
-        await page.close();
-    }
-};
-
-export const searchDevicesDirect = async (context, query, limit = 5) => {
-    const cacheKey = `${query.toLowerCase()}-${limit}`;
-    const cached = searchCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL) return cached.results;
-
-    const types = detectLikelyTypes(query);
-    const page = await context.newPage();
-    try {
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            if (['font', 'media', 'image', 'stylesheet'].includes(type)) route.abort();
-            else route.continue();
-        });
-        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-        const results = await runSearchFetches(page, query, limit, types);
-        results.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
-        searchCache.set(cacheKey, { results, timestamp: Date.now() });
-        if (searchCache.size > 100) searchCache.delete(searchCache.keys().next().value);
-        return results;
-    } finally {
-        await page.close();
-    }
 };
 
 const extractImages = ($) => {
@@ -176,7 +56,145 @@ const extractImages = ($) => {
     return [...new Set(images)];
 };
 
+const parseDevicePage = (html, deviceUrl, query, searchResults) => {
+    const $ = cheerio.load(html);
+    const data = {
+        title: $('h1').text().trim(),
+        sourceUrl: deviceUrl,
+        images: extractImages($),
+        scores: {}, pros: [], cons: [], specs: {},
+        matchedQuery: query,
+        searchResults: searchResults?.map((r, i) => ({
+            index: i, name: r.name, type: r.content_type, slug: r.slug || r.url_name,
+        })),
+    };
+    $('[class*="score"], .progress-bar, .rating-box').each((_, el) => {
+        const label = $(el).find('[class*="title"], [class*="name"]').first().text().trim() || $(el).prev('div, p, span').text().trim();
+        const value = $(el).find('[class*="value"], [class*="num"]').first().text().trim() || $(el).text().replace(/[^0-9]/g, '').trim();
+        if (label && value && label !== value) data.scores[label] = value;
+    });
+    $('[class*="pros"] li, [class*="plus"] li, .green li').each((_, el) => { const t = $(el).text().trim(); if (t) data.pros.push(t); });
+    $('[class*="cons"] li, [class*="minus"] li, .red li').each((_, el) => { const t = $(el).text().trim(); if (t) data.cons.push(t); });
+    $('.card, .box, section, [class*="specs"]').each((_, card) => {
+        const st = $(card).find('.card-header, .card-title, h2, h3').first().text().trim() || 'Details';
+        const section = {};
+        $(card).find('table tr').each((__, row) => {
+            const cells = $(row).find('td, th');
+            if (cells.length >= 2) {
+                const label = cells.first().text().trim().replace(/:$/, '');
+                const value = cells.last().text().trim();
+                if (label && value && label !== value) section[label] = value;
+            }
+        });
+        if (Object.keys(section).length > 0) data.specs[st] = section;
+    });
+    return data;
+};
+
+export const searchAndScrape = async (context, query, index) => {
+    const cacheKey = `search:${query.toLowerCase()}:${index ?? 'top'}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) { console.log(`[cache hit] ${query}`); return cached; }
+
+    const types = detectLikelyTypes(query);
+    const page = await context.newPage();
+    try {
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['font', 'media', 'image', 'stylesheet'].includes(type)) route.abort();
+            else route.continue();
+        });
+
+        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        const searchResults = await runSearchFetches(page, query, 5, types);
+        if (!searchResults.length) return null;
+
+        searchResults.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
+
+        // Cache just the search results too
+        cacheSet(`searchonly:${query.toLowerCase()}`, searchResults);
+
+        let item;
+        if (index !== undefined) {
+            item = searchResults[Math.min(parseInt(index, 10) || 0, searchResults.length - 1)];
+        } else {
+            item = searchResults.find(r => r.name.toLowerCase() === query.toLowerCase()) || searchResults[0];
+        }
+
+        const slug = item.slug || item.url_name || item.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+        const deviceUrl = `https://nanoreview.net/en/${item.content_type}/${slug}`;
+
+        // Reuse same page — navigate to device page
+        await page.goto(deviceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        const html = await page.content();
+        const data = parseDevicePage(html, deviceUrl, query, searchResults);
+
+        const result = { data, searchResults };
+        cacheSet(cacheKey, result);
+
+        // Background: also cache by device URL so repeat scrapes are instant
+        cacheSet(`url:${deviceUrl}`, data);
+
+        return result;
+    } finally {
+        await page.close();
+    }
+};
+
+// Used for pre-warming: scrape a known URL directly (no search needed)
+export const scrapeUrl = async (context, deviceUrl, label = '') => {
+    const cacheKey = `url:${deviceUrl}`;
+    if (cacheGet(cacheKey)) return; // already cached
+
+    const page = await context.newPage();
+    try {
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['font', 'media', 'image', 'stylesheet'].includes(type)) route.abort();
+            else route.continue();
+        });
+        await page.goto(deviceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        const html = await page.content();
+        const data = parseDevicePage(html, deviceUrl, label, null);
+        cacheSet(cacheKey, data);
+        // Also cache by search query label
+        if (label) cacheSet(`search:${label.toLowerCase()}:top`, { data, searchResults: [] });
+        console.log(`[prewarm] cached ${label || deviceUrl}`);
+    } catch (e) {
+        console.error(`[prewarm] failed ${label}: ${e.message}`);
+    } finally {
+        await page.close();
+    }
+};
+
+export const searchDevicesDirect = async (context, query, limit = 5) => {
+    const cacheKey = `searchonly:${query.toLowerCase()}:${limit}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+
+    const types = detectLikelyTypes(query);
+    const page = await context.newPage();
+    try {
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['font', 'media', 'image', 'stylesheet'].includes(type)) route.abort();
+            else route.continue();
+        });
+        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        const results = await runSearchFetches(page, query, limit, types);
+        results.sort((a, b) => scoreMatch(b.name, query) - scoreMatch(a.name, query));
+        cacheSet(cacheKey, results);
+        return results;
+    } finally {
+        await page.close();
+    }
+};
+
 export const scrapeComparePage = async (context, compareUrl) => {
+    const cacheKey = `url:${compareUrl}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+
     const page = await context.newPage();
     try {
         await page.route('**/*', (route) => {
@@ -203,6 +221,7 @@ export const scrapeComparePage = async (context, compareUrl) => {
             });
             if (Object.keys(section).length > 0) data.comparisons[st] = section;
         });
+        cacheSet(cacheKey, data);
         return data;
     } finally {
         await page.close();
@@ -210,6 +229,10 @@ export const scrapeComparePage = async (context, compareUrl) => {
 };
 
 export const scrapeRankingPage = async (context, rankingUrl) => {
+    const cacheKey = `url:${rankingUrl}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+
     const page = await context.newPage();
     try {
         await page.route('**/*', (route) => {
@@ -233,6 +256,7 @@ export const scrapeRankingPage = async (context, rankingUrl) => {
             });
             if (Object.keys(item).length > 0) data.rankings.push(item);
         });
+        cacheSet(cacheKey, data);
         return data;
     } finally {
         await page.close();
