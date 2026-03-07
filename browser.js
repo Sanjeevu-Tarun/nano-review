@@ -1,112 +1,82 @@
 import { chromium } from 'playwright';
-import https from 'https';
 
 let _browser = null;
-let _launchPromise = null;
-let _cfContext = null;
+let _context = null;
 let _cfReady = false;
-let _cfCookies = ''; // raw cookie string extracted from context
+let _cfCookieStr = '';
 
-const getBrowser = async () => {
-    if (_browser?.isConnected()) return _browser;
-    if (_launchPromise) return _launchPromise;
-    _launchPromise = chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage'],
-        timeout: 30000,
-    }).then(b => {
-        _browser = b;
-        _launchPromise = null;
-        b.on('disconnected', () => { _browser = null; _launchPromise = null; _cfContext = null; _cfReady = false; _cfCookies = ''; });
-        return b;
-    });
-    return _launchPromise;
-};
+export const isCFReady = () => _cfReady;
+export const getCFCookies = () => _cfCookieStr;
 
-const createContext = async (browser) => {
-    const context = await browser.newContext({
-        viewport: { width: 1280, height: 720 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        locale: 'en-US',
-        timezoneId: 'America/New_York',
-        extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
-    });
-    await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        window.chrome = { runtime: {} };
-    });
-    return context;
-};
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 export const warmupCF = async () => {
     if (_cfReady) return;
-    try {
-        const browser = await getBrowser();
-        _cfContext = await createContext(browser);
-        const page = await _cfContext.newPage();
-        await page.route('**/*', (route) => {
-            const t = route.request().resourceType();
-            if (['font', 'media', 'image', 'stylesheet'].includes(t)) route.abort();
-            else route.continue();
+    console.log('[warmup] starting browser...');
+
+    if (!_browser) {
+        _browser = await chromium.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
         });
-        await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 25000 });
-        await waitForCloudflare(page, 'body', 20000);
-
-        // Extract CF cookies so Node can call the API directly without browser
-        const cookies = await _cfContext.cookies('https://nanoreview.net');
-        _cfCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-        console.log(`CF warmup done ✓ (${cookies.length} cookies extracted)`);
-
-        await page.close();
-        _cfReady = true;
-    } catch (e) {
-        console.error('CF warmup failed:', e.message);
-        _cfContext = null; _cfReady = false; _cfCookies = '';
     }
+
+    _context = await _browser.newContext({
+        userAgent: UA,
+        locale: 'en-US',
+        extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+    });
+    await _context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+    });
+
+    const page = await _context.newPage();
+    await page.route('**/*', route => {
+        const t = route.request().resourceType();
+        ['font', 'media', 'image', 'stylesheet'].includes(t) ? route.abort() : route.continue();
+    });
+
+    console.log('[warmup] navigating to nanoreview...');
+    const t0 = Date.now();
+    await page.goto('https://nanoreview.net/en/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    // Wait until CF challenge is gone
+    for (let i = 0; i < 30; i++) {
+        const title = await page.title().catch(() => '');
+        if (!/just a moment|cloudflare|checking/i.test(title)) break;
+        await page.waitForTimeout(1000);
+    }
+
+    // Extract cookies for direct Node fetch
+    const cookies = await _context.cookies('https://nanoreview.net');
+    _cfCookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    _cfReady = true;
+
+    await page.close();
+    console.log(`[warmup] done in ${Date.now() - t0}ms, ${cookies.length} cookies`);
 };
 
-// Fast Node.js HTTP request using CF cookies — no browser needed
-export const nodeFetch = (url) => new Promise((resolve, reject) => {
-    const options = {
+export const getContext = () => _context;
+
+// Direct Node HTTPS fetch using stored CF cookies — no browser needed
+import { request } from 'https';
+export const cfFetch = (url) => new Promise((resolve, reject) => {
+    const opts = {
         headers: {
+            'User-Agent': UA,
             'Accept': 'application/json',
             'Accept-Language': 'en-US,en;q=0.9',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             'Referer': 'https://nanoreview.net/en/',
-            'Cookie': _cfCookies,
+            'Cookie': _cfCookieStr,
         }
     };
-    https.get(url, options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
+    request(url, opts, res => {
+        let body = '';
+        res.on('data', d => body += d);
         res.on('end', () => {
-            try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-            catch { resolve({ status: res.statusCode, data: null }); }
+            try { resolve({ ok: res.statusCode === 200, json: JSON.parse(body) }); }
+            catch { resolve({ ok: false, json: null, raw: body.slice(0, 200) }); }
         });
-    }).on('error', reject);
+    }).on('error', reject).end();
 });
-
-export const getCFCookies = () => _cfCookies;
-export const isCFReady = () => _cfReady;
-
-export const getBrowserContext = async () => {
-    if (_cfReady && _cfContext) return { browser: { close: async () => {} }, context: _cfContext };
-    const browser = await getBrowser();
-    const context = await createContext(browser);
-    return { browser: { close: async () => { await context.close().catch(() => {}); } }, context };
-};
-
-export const waitForCloudflare = async (page, selector, timeout = 20000) => {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-        const title = await page.title().catch(() => '');
-        const isChallenge = /just a moment|attention required|cloudflare|verify|human|checking your browser/i.test(title);
-        if (!isChallenge) {
-            const hasContent = await page.evaluate(() => document.body?.innerHTML?.length > 100).catch(() => false);
-            if (hasContent) return true;
-        }
-        await page.waitForTimeout(500);
-    }
-    throw new Error(`CF timeout after ${timeout}ms`);
-};
