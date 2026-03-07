@@ -5,7 +5,6 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-# Playwright browsers are already included in the base image
 COPY . .
 
 ENV NODE_ENV=production
