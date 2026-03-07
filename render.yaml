@@ -11,5 +11,3 @@ services:
         value: production
       - key: PORT
         value: 3000
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/project/.playwright
